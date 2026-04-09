@@ -4,6 +4,7 @@ import random
 import socket
 import struct
 import sys
+import time
 
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", 6343))
 FORWARD_RATE = int(os.environ.get("FORWARD_RATE", 100))  # sampling rate stamped on all forwarded flows
@@ -40,11 +41,90 @@ def _load_device_rates() -> dict[str, int]:
 
 DEVICE_RATES: dict[str, int] = _load_device_rates()
 
+# How long a source must be silent before it is logged again (seconds).
+SOURCE_LOG_INTERVAL = int(os.environ.get("SOURCE_LOG_INTERVAL", 300))
+_source_last_seen: dict[str, float] = {}
+
 DATAGRAM_HEADER_SIZE = 28
 SAMPLE_TYPE_FLOW = 1
 SAMPLE_TYPE_COUNTER = 2
 
 _TCP_FRAME = struct.Struct("!I")  # 4-byte big-endian length prefix
+
+
+def _maybe_log_source(data: bytes, transport: str) -> None:
+    """Log a source on first appearance and again after SOURCE_LOG_INTERVAL silence.
+
+    Reads the raw datagram before any normalization so the log reflects exactly
+    what the device is sending.
+    """
+    if len(data) < DATAGRAM_HEADER_SIZE:
+        return
+    if struct.unpack_from("!I", data, 4)[0] != 1:  # only IPv4 agent addresses
+        return
+
+    agent_ip = socket.inet_ntoa(data[8:12])
+    now = time.monotonic()
+    last = _source_last_seen.get(agent_ip)
+    if last is not None and now - last < SOURCE_LOG_INTERVAL:
+        return
+    _source_last_seen[agent_ip] = now
+
+    label = "NEW_SOURCE" if last is None else "SOURCE_REAPPEARED"
+
+    sub_agent_id = struct.unpack_from("!I", data, 12)[0]
+    seq           = struct.unpack_from("!I", data, 16)[0]
+    num_samples   = struct.unpack_from("!I", data, 24)[0]
+
+    # Walk samples to tally types and grab the first embedded flow rate.
+    flow_count = counter_count = 0
+    embedded_rate: int | None = None
+    offset = DATAGRAM_HEADER_SIZE
+    for _ in range(num_samples):
+        if offset + 8 > len(data):
+            break
+        sample_type, sample_length = struct.unpack_from("!II", data, offset)
+        if sample_type == SAMPLE_TYPE_FLOW:
+            flow_count += 1
+            if embedded_rate is None and offset + 16 + 4 <= len(data):
+                # sampling_rate sits at byte 8 inside the flow sample data,
+                # which starts at offset+8 — so it is at offset+16 overall.
+                embedded_rate = struct.unpack_from("!I", data, offset + 16)[0]
+        elif sample_type == SAMPLE_TYPE_COUNTER:
+            counter_count += 1
+        offset += 8 + sample_length
+
+    # Describe what rate the proxy will apply and why.
+    if embedded_rate is not None:
+        if agent_ip in DEVICE_RATES:
+            applied = DEVICE_RATES[agent_ip]
+            rate_src = f"override={applied}"
+        elif embedded_rate == 0:
+            applied = DEFAULT_SAMPLING_RATE
+            rate_src = f"no_rate→default={DEFAULT_SAMPLING_RATE}"
+        else:
+            applied = embedded_rate
+            rate_src = f"embedded={embedded_rate}"
+
+        if applied > FORWARD_RATE:
+            action = f"downscale×{applied // FORWARD_RATE}"
+        elif applied < FORWARD_RATE:
+            action = f"upscale_prob={round(applied / FORWARD_RATE * 100)}%_forwarded"
+        else:
+            action = "exact_match"
+        rate_info = f"embedded_rate={embedded_rate} rate_src={rate_src} action={action}"
+    else:
+        rate_info = "flow_samples=0"
+
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    print(
+        f"{ts} {label}"
+        f" agent={agent_ip} transport={transport}"
+        f" sub_agent_id={sub_agent_id} seq={seq}"
+        f" flow_samples={flow_count} counter_samples={counter_count}"
+        f" {rate_info}",
+        flush=True,
+    )
 
 
 def normalize_flow_sample(data: bytes, agent_ip: str | None = None) -> bytes | None:
@@ -152,6 +232,7 @@ class SFlowProtocol(asyncio.DatagramProtocol):
         self._sock = forward_sock
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
+        _maybe_log_source(data, "UDP")
         try:
             packet = parse_datagram(data)
         except Exception as exc:
@@ -192,6 +273,7 @@ async def handle_tcp_connection(
             except asyncio.IncompleteReadError:
                 break
 
+            _maybe_log_source(data, "TCP")
             try:
                 packet = parse_datagram(data)
             except Exception as exc:
