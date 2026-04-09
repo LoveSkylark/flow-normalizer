@@ -1,0 +1,9 @@
+services:
+  sflow-normalizer:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "${LISTEN_PORT}:${LISTEN_PORT}/udp"
+      - "${LISTEN_PORT}:${LISTEN_PORT}/tcp"
+    restart: unless-stopped
