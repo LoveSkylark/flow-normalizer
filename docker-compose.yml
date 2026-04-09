@@ -1,5 +1,5 @@
 services:
-  sflow-normalizer:
+  flow-normalizer:
     build: .
     env_file:
       - .env

@@ -1,4 +1,4 @@
-# sflow-normalizer
+# flow-normalizer
 
 A UDP/TCP proxy that receives **sFlow v5**, **NetFlow v5/v9**, and **IPFIX**
 packets, normalises embedded sampling rates to a single configured target, and

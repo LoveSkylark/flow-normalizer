@@ -1,5 +1,5 @@
 """
-sflow-normalizer test harness.
+flow-normalizer test harness.
 
 Starts a mock collector on COLLECTOR_PORT, sends crafted sFlow v5 packets
 to the proxy on PROXY_PORT, and verifies the collector receives the expected
@@ -281,7 +281,7 @@ def run_tests() -> None:
             sys.exit(1)
         return
 
-    print("\n=== sflow-normalizer test suite ===\n")
+    print("\n=== flow-normalizer test suite ===\n")
 
     # -----------------------------------------------------------------------
     # Scenario 1: 1/1 → 1/100

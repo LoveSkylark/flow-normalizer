@@ -784,7 +784,7 @@ async def main() -> None:
 
     override_info = f" device_overrides={len(DEVICE_RATES)}" if DEVICE_RATES else ""
     print(
-        f"sflow-normalizer listening on :{SFLOW_PORT} (UDP+TCP) "
+        f"flow-normalizer sflow listening on :{SFLOW_PORT} (UDP+TCP) "
         f"→ {FORWARD_IP}:{SFLOW_FORWARD_PORT} "
         f"forward_rate={FORWARD_RATE} default_rate={DEFAULT_SAMPLING_RATE}"
         f"{override_info}",
