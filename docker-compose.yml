@@ -3,7 +3,11 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      - SFLOW_PORT=6343
+      - NETFLOW_LISTEN_PORT=2055
     ports:
-      - "${LISTEN_PORT}:${LISTEN_PORT}/udp"
-      - "${LISTEN_PORT}:${LISTEN_PORT}/tcp"
+      - "${SFLOW_PORT:-6343}:6343/udp"
+      - "${SFLOW_PORT:-6343}:6343/tcp"
+      - "${NETFLOW_LISTEN_PORT:-2055}:2055/udp"
     restart: unless-stopped

@@ -1,9 +1,14 @@
 # sflow-normalizer
 
-A stateless UDP/TCP proxy that receives sFlow v5 packets, normalises the
-embedded sampling rate to a single configured target, and forwards them to a
-downstream collector. Every device in your network can sample at whatever rate
-it likes; the collector always sees one consistent rate in every flow record.
+A UDP/TCP proxy that receives **sFlow v5**, **NetFlow v5/v9**, and **IPFIX**
+packets, normalises embedded sampling rates to a single configured target, and
+forwards them to a downstream collector. Every device in your network can
+sample at whatever rate it likes; the collector always sees one consistent rate
+in every flow record.
+
+sFlow is handled on one port (default 6343, UDP + TCP); NetFlow / IPFIX on a
+separate port (default 2055, UDP only). NetFlow v5 input is converted to
+NetFlow v9 on output. NetFlow v9 and IPFIX are normalised in place.
 
 ---
 
@@ -58,21 +63,26 @@ and edit before starting.
 | Variable | Default | Required | Description |
 |---|---|---|---|
 | `FORWARD_IP` | — | **yes** | Downstream collector IP address |
-| `FORWARD_PORT` | `6343` | no | Downstream collector UDP/TCP port |
+| `SFLOW_FORWARD_PORT` | `6343` | no | Downstream collector UDP/TCP port for sFlow |
 | `FORWARD_RATE` | `100` | no | Sampling rate stamped into all forwarded flow samples |
-| `DEFAULT_SAMPLING_RATE` | `512` | no | Assumed input rate for devices that send `sampling_rate = 0` (no rate embedded). Has no effect on the output rate — all output is always stamped `FORWARD_RATE`. |
+| `DEFAULT_SAMPLING_RATE` | `512` | no | Assumed input rate for devices that send no embedded rate. Has no effect on the output rate — all output is always stamped `FORWARD_RATE`. |
 | `DEVICE_RATES` | — | no | Per-device rate overrides — see below |
-| `LISTEN_PORT` | `6343` | no | UDP/TCP port the proxy binds and listens on |
+| `SFLOW_PORT` | `6343` | no | UDP/TCP port the proxy binds for sFlow. In Docker this is the **external** host port — the container always binds internally on 6343. |
+| `NETFLOW_LISTEN_PORT` | `2055` | no | UDP port the proxy binds for NetFlow / IPFIX. In Docker this is the **external** host port — the container always binds internally on 2055. |
+| `NETFLOW_FORWARD_PORT` | `2055` | no | Downstream collector UDP port for NetFlow / IPFIX output |
 
 ### Per-device rate overrides (`DEVICE_RATES`)
 
-Some devices send sFlow with no embedded rate (`sampling_rate = 0`) and you
-know exactly what rate they are running at. Others may embed a rate but it is
-wrong. `DEVICE_RATES` lets you pin the assumed input rate per device IP,
-overriding both the embedded rate and `DEFAULT_SAMPLING_RATE`.
+Some devices send flow data with no embedded rate and you know exactly what
+rate they are running at. Others may embed a rate but it is wrong. `DEVICE_RATES`
+lets you pin the assumed input rate per device IP, overriding both the embedded
+rate and `DEFAULT_SAMPLING_RATE`.
 
-The match key is the `agent_address` field in the sFlow datagram header — the
-device's own self-reported IP, not the network-layer source address.
+For **sFlow** the match key is the `agent_address` field in the datagram header
+— the device's own self-reported IP, not the network-layer source address.
+
+For **NetFlow / IPFIX** the match key is the UDP source IP of the packet
+(NetFlow v5 has no equivalent of sFlow's agent_address field).
 
 ```
 # .env
@@ -102,6 +112,9 @@ FORWARD_IP=192.168.1.10 python3 proxy.py
 ```
 
 No pip dependencies — stdlib only.
+
+The proxy will listen on both sFlow (`:6343 UDP+TCP`) and NetFlow (`:2055 UDP`)
+simultaneously and forward both streams to the same downstream collector IP.
 
 ---
 
@@ -214,29 +227,78 @@ python3 test_sender.py 16344 16343
 
 ---
 
+## NetFlow / IPFIX
+
+### Inputs and output format
+
+| Input | Output | Notes |
+|---|---|---|
+| NetFlow v5 | NetFlow v9 | Template FlowSet (ID 256) prepended to every packet |
+| NetFlow v9 | NetFlow v9 | Template FlowSets cached, forwarded unchanged |
+| IPFIX (v10) | IPFIX (v10) | Template Sets cached, forwarded unchanged; message length field updated |
+
+### Sampling rate resolution (NetFlow / IPFIX)
+
+NetFlow v9 and IPFIX carry sampling rate information in Options Templates,
+which vary by vendor and are complex to parse reliably. The proxy uses a
+simpler, predictable resolution order:
+
+1. `DEVICE_RATES` override for the source IP — highest priority
+2. Embedded `sampling_interval` from the NetFlow v5 header (lower 14 bits, if non-zero)
+3. `DEFAULT_SAMPLING_RATE` fallback
+
+For v9 and IPFIX, where there is no single embedded sampling rate field in the
+data FlowSet, the proxy always falls back to `DEVICE_RATES` or
+`DEFAULT_SAMPLING_RATE`. Set `DEVICE_RATES` per exporter IP for accurate
+normalisation.
+
+### What is normalised
+
+For NetFlow v5, each flow record's `dPkts` and `dOctets` fields are scaled
+(downscale: multiply by ratio; upscale: probabilistic drop). The v9 output is
+stamped with the normalised counts — no separate sampling rate field in the
+data record.
+
+For NetFlow v9 and IPFIX, the proxy locates `IN_BYTES` (field 1), `IN_PKTS`
+(field 2), `OUT_BYTES` (field 23), and `OUT_PKTS` (field 24) within each data
+record using the cached template and scales them by the same ratio. If a
+template has not yet been received for a given data FlowSet, those records are
+forwarded as-is.
+
+---
+
 ## Architecture
 
 ```
 asyncio event loop
-  ├── UDP DatagramProtocol  (LISTEN_PORT)
+  ├── sFlow UDP DatagramProtocol  (LISTEN_PORT)
   │     datagram_received()
   │       └── parse_datagram() → normalize_flow_sample()
   │             └── forward_sock.sendto() → FORWARD_IP:FORWARD_PORT (UDP)
   │
-  └── TCP asyncio.start_server  (LISTEN_PORT)
-        handle_tcp_connection()  [one coroutine per inbound connection]
-          read 4-byte length prefix + body
-          └── parse_datagram() → normalize_flow_sample()
-                └── asyncio.open_connection() → FORWARD_IP:FORWARD_PORT (TCP)
-                      write 4-byte length prefix + normalised body
+  ├── sFlow TCP asyncio.start_server  (LISTEN_PORT)
+  │     handle_tcp_connection()  [one coroutine per inbound connection]
+  │       read 4-byte length prefix + body
+  │       └── parse_datagram() → normalize_flow_sample()
+  │             └── asyncio.open_connection() → FORWARD_IP:FORWARD_PORT (TCP)
+  │                   write 4-byte length prefix + normalised body
+  │
+  └── NetFlow UDP DatagramProtocol  (NETFLOW_LISTEN_PORT)
+        datagram_received()
+          └── parse_netflow()
+                ├── v5 → convert_nf5_to_nf9()     normalise + convert
+                ├── v9 → normalize_nf9()           cache templates, normalise data
+                └── v10 → normalize_ipfix()        cache templates, normalise data
+                      └── nf_forward_sock.sendto() → NETFLOW_FORWARD_IP:NETFLOW_FORWARD_PORT
 ```
 
 Rules:
 - Single asyncio event loop, no threads
-- One persistent UDP send socket (not bound)
-- One outbound TCP connection per inbound TCP connection
+- One persistent UDP send socket per protocol (sFlow, NetFlow)
+- One outbound TCP connection per inbound sFlow TCP connection
 - No buffering, no queuing — process and forward in the same callback
-- No disk I/O, no state, no external dependencies
+- NetFlow v9/IPFIX template cache is in-process memory (stateful — templates
+  are lost on restart, but re-populated on the next template packet from the device)
 - Malformed packets are logged to stderr and dropped; they never crash the loop
 
 ---
@@ -270,3 +332,71 @@ Flow sample (type=1) layout inside sample_data:
 ```
 
 Full specification: https://sflow.org/sflow_version_5.txt
+
+---
+
+## NetFlow v5 packet structure reference
+
+```
+Header (24 bytes)
+  version           uint16  = 5
+  count             uint16  (number of flow records)
+  sys_uptime        uint32  (ms)
+  unix_secs         uint32
+  unix_nsecs        uint32
+  flow_sequence     uint32
+  engine_type       uint8
+  engine_id         uint8
+  sampling_interval uint16  (bits [15:14] = mode, bits [13:0] = interval)
+
+Flow record (48 bytes) — repeated count times
+  srcaddr    uint32   IPV4_SRC_ADDR
+  dstaddr    uint32   IPV4_DST_ADDR
+  nexthop    uint32   IPV4_NEXT_HOP
+  input      uint16   INPUT_SNMP
+  output     uint16   OUTPUT_SNMP
+  dPkts      uint32   IN_PKTS      ← scaled by proxy
+  dOctets    uint32   IN_BYTES     ← scaled by proxy
+  first      uint32   FIRST_SWITCHED
+  last       uint32   LAST_SWITCHED
+  srcport    uint16   L4_SRC_PORT
+  dstport    uint16   L4_DST_PORT
+  pad1       uint8    (zero)
+  tcp_flags  uint8    TCP_FLAGS
+  prot       uint8    PROTOCOL
+  tos        uint8    SRC_TOS
+  src_as     uint16   SRC_AS
+  dst_as     uint16   DST_AS
+  src_mask   uint8    SRC_MASK
+  dst_mask   uint8    DST_MASK
+  pad2       uint16   (zero)
+```
+
+The proxy converts each v5 packet to a v9 packet containing:
+1. A Template FlowSet (ID=0) describing the 18 fields above (minus padding)
+2. A Data FlowSet (ID=256) with the normalised flow records
+
+## NetFlow v9 / IPFIX packet structure reference
+
+```
+NetFlow v9 header (20 bytes)
+  version           uint16  = 9
+  count             uint16  (total records in PDU)
+  sys_uptime        uint32  (ms)
+  unix_secs         uint32
+  package_sequence  uint32
+  source_id         uint32
+
+IPFIX header (16 bytes)
+  version           uint16  = 10
+  length            uint16  (total message length, updated by proxy)
+  export_time       uint32
+  sequence_number   uint32
+  observation_domain_id  uint32
+
+FlowSet / Set header (4 bytes, shared by v9 and IPFIX)
+  id     uint16  (0 = Template, 1 = Options Template, 256+ = Data)
+  length uint16  (total including this header)
+```
+
+Full specifications: RFC 3954 (NetFlow v9), RFC 7011 (IPFIX)
