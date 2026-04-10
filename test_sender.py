@@ -1,13 +1,18 @@
 """
 flow-normalizer test harness.
 
-Starts a mock collector on COLLECTOR_PORT, sends crafted sFlow v5 packets
-to the proxy on PROXY_PORT, and verifies the collector receives the expected
-normalized output.
+Starts mock collectors, sends crafted sFlow and NetFlow/IPFIX packets to the
+proxy, and verifies the collector receives expected normalized output.
 
 Usage (proxy must already be running):
-    FORWARD_PORT=16343 FORWARD_RATE=100 DEFAULT_SAMPLING_RATE=512 python proxy.py &
-    python test_sender.py
+    FORWARD_IP=127.0.0.1 FORWARD_RATE=100 DEFAULT_SAMPLING_RATE=512 \\
+      SFLOW_FORWARD_PORT=16343 NETFLOW_FORWARD_PORT=16055 \\
+      python proxy.py
+
+    python test_sender.py [sflow_proxy_port [sflow_col_port [override [nf_proxy_port [nf_col_port]]]]]
+
+Defaults: sflow_proxy=6343  sflow_col=16343  nf_proxy=2055  nf_col=16055
+Example:  python test_sender.py 6343 16343 "" 2055 16055
 """
 
 import socket
@@ -21,8 +26,10 @@ PROXY_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6343
 COLLECTOR_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 16343
 # Optional: pass "ip:rate" as 3rd arg to test per-device override.
 # The proxy must have been started with DEVICE_RATES=<ip>:<rate> matching.
-# Example: python3 test_sender.py 16344 16343 127.0.0.1:200
-OVERRIDE_ARG = sys.argv[3] if len(sys.argv) > 3 else None
+# Example: python3 test_sender.py 6343 16343 127.0.0.1:200
+OVERRIDE_ARG = sys.argv[3] if (len(sys.argv) > 3 and sys.argv[3]) else None
+NF_PROXY_PORT    = int(sys.argv[4]) if len(sys.argv) > 4 else 2055
+NF_COLLECTOR_PORT = int(sys.argv[5]) if len(sys.argv) > 5 else 16055
 FORWARD_RATE = 100
 DEFAULT_SAMPLING_RATE = 512
 
@@ -100,6 +107,7 @@ def make_malformed_packet() -> bytes:
 
 received: list[bytes] = []
 tcp_received: list[bytes] = []
+nf_received: list[bytes] = []
 lock = threading.Lock()
 
 
@@ -125,6 +133,18 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
             return None
         buf += chunk
     return buf
+
+
+def nf_collector_thread(sock: socket.socket, stop_event: threading.Event) -> None:
+    """UDP collector for NetFlow/IPFIX output from the proxy."""
+    sock.settimeout(0.2)
+    while not stop_event.is_set():
+        try:
+            data, _ = sock.recvfrom(65535)
+            with lock:
+                nf_received.append(data)
+        except socket.timeout:
+            continue
 
 
 def tcp_collector_thread(server_sock: socket.socket, stop_event: threading.Event) -> None:
@@ -169,6 +189,136 @@ def parse_flow_sample_pool(data: bytes) -> int:
     _, sample_length = struct.unpack_from("!II", data, offset)
     sample_data = data[offset + 8 : offset + 8 + sample_length]
     return struct.unpack_from("!I", sample_data, 12)[0]
+
+
+# ---------------------------------------------------------------------------
+# NetFlow / IPFIX packet builders
+# ---------------------------------------------------------------------------
+
+# Wire formats — must match proxy.py exactly.
+_NF5_HDR = struct.Struct("!HHIIIIBBH")               # 24 bytes
+_NF5_REC = struct.Struct("!IIIHHIIIIHHxBBBHHBB2x")  # 48 bytes
+
+# Template ID and field definitions used for our v9 / IPFIX test packets.
+# Fields: IN_PKTS (type=2, len=4), IN_BYTES (type=1, len=4) — 8 bytes per record.
+_NF9_TMPL_ID   = 300
+_IPFIX_TMPL_ID = 301
+_TEST_FIELDS    = [(2, 4), (1, 4)]
+
+
+def build_nf5(sampling_interval: int, dpkts: int = 1, doctets: int = 1500) -> bytes:
+    """Build a minimal NetFlow v5 datagram with one flow record."""
+    hdr = _NF5_HDR.pack(5, 1, 12345, int(time.time()), 0, 1, 0, 0, sampling_interval)
+    rec = _NF5_REC.pack(
+        0x7F000001, 0x08080808, 0,  # src=127.0.0.1, dst=8.8.8.8, nexthop=0
+        1, 2,                        # input, output
+        dpkts, doctets,
+        0, 0,                        # first, last
+        12345, 80,                   # srcport, dstport
+        0, 6, 0,                     # tcp_flags, protocol=TCP, tos
+        0, 0, 0, 0,                  # src_as, dst_as, src_mask, dst_mask
+    )
+    return hdr + rec
+
+
+def _build_nf9_tmpl_flowset(tmpl_id: int, fields: list) -> bytes:
+    body = struct.pack("!HH", tmpl_id, len(fields))
+    for ftype, flen in fields:
+        body += struct.pack("!HH", ftype, flen)
+    body_len = 4 + len(body)
+    pad = (-body_len) & 3
+    return struct.pack("!HH", 0, body_len + pad) + body + bytes(pad)
+
+
+def build_nf9_packet(tmpl_id: int, fields: list, dpkts: int, doctets: int) -> bytes:
+    """Build a NetFlow v9 packet with template + data flowsets in one message."""
+    tmpl_fs = _build_nf9_tmpl_flowset(tmpl_id, fields)
+    record   = struct.pack("!II", dpkts, doctets)  # both fields are 4 bytes
+    data_len = 4 + len(record)
+    pad      = (-data_len) & 3
+    data_fs  = struct.pack("!HH", tmpl_id, data_len + pad) + record + bytes(pad)
+    # v9 header: version(2) count(2=2 flowsets) uptime(4) unix_secs(4) seq(4) src_id(4)
+    hdr = struct.pack("!HHIIII", 9, 2, 12345, int(time.time()), 1, 0)
+    return hdr + tmpl_fs + data_fs
+
+
+def build_ipfix_packet(tmpl_id: int, fields: list, dpkts: int, doctets: int) -> bytes:
+    """Build an IPFIX message with template set + data set."""
+    tmpl_body = struct.pack("!HH", tmpl_id, len(fields))
+    for ftype, flen in fields:
+        tmpl_body += struct.pack("!HH", ftype, flen)
+    body_len  = 4 + len(tmpl_body)
+    pad       = (-body_len) & 3
+    tmpl_set  = struct.pack("!HH", 2, body_len + pad) + tmpl_body + bytes(pad)
+
+    record   = struct.pack("!II", dpkts, doctets)
+    data_len = 4 + len(record)
+    pad2     = (-data_len) & 3
+    data_set = struct.pack("!HH", tmpl_id, data_len + pad2) + record + bytes(pad2)
+
+    total_len = 16 + len(tmpl_set) + len(data_set)
+    hdr = struct.pack("!HHIII", 10, total_len, int(time.time()), 1, 0)
+    return hdr + tmpl_set + data_set
+
+
+# ---------------------------------------------------------------------------
+# NetFlow / IPFIX output parsers
+# ---------------------------------------------------------------------------
+
+# Proxy uses template ID 256 for all v5-converted output.
+# Data records are 45 bytes: IIIHHIIIIHHBBBHHBB — dpkts at +16, doctets at +20.
+_V5_OUT_TMPL_ID = 256
+
+
+def parse_nf5_v9_output(data: bytes) -> tuple[int, int] | None:
+    """Return (dpkts, doctets) from the first record of a proxy v5→v9 output packet."""
+    if len(data) < 20 or struct.unpack_from("!H", data, 0)[0] != 9:
+        return None
+    offset = 20
+    while offset + 4 <= len(data):
+        fs_id, fs_len = struct.unpack_from("!HH", data, offset)
+        if fs_id == _V5_OUT_TMPL_ID and offset + 4 + 45 <= len(data):
+            dpkts   = struct.unpack_from("!I", data, offset + 4 + 16)[0]
+            doctets = struct.unpack_from("!I", data, offset + 4 + 20)[0]
+            return dpkts, doctets
+        if fs_len < 4:
+            break
+        offset += fs_len
+    return None
+
+
+def parse_nf9_data(data: bytes, tmpl_id: int) -> tuple[int, int] | None:
+    """Return (field1_val, field2_val) from first record of a v9 data flowset."""
+    if len(data) < 20 or struct.unpack_from("!H", data, 0)[0] != 9:
+        return None
+    offset = 20
+    while offset + 4 <= len(data):
+        fs_id, fs_len = struct.unpack_from("!HH", data, offset)
+        if fs_id == tmpl_id and offset + 4 + 8 <= len(data):
+            f1 = struct.unpack_from("!I", data, offset + 4)[0]
+            f2 = struct.unpack_from("!I", data, offset + 8)[0]
+            return f1, f2
+        if fs_len < 4:
+            break
+        offset += fs_len
+    return None
+
+
+def parse_ipfix_data(data: bytes, tmpl_id: int) -> tuple[int, int] | None:
+    """Return (field1_val, field2_val) from first record of an IPFIX data set."""
+    if len(data) < 16 or struct.unpack_from("!H", data, 0)[0] != 10:
+        return None
+    offset = 16
+    while offset + 4 <= len(data):
+        set_id, set_len = struct.unpack_from("!HH", data, offset)
+        if set_id == tmpl_id and offset + 4 + 8 <= len(data):
+            f1 = struct.unpack_from("!I", data, offset + 4)[0]
+            f2 = struct.unpack_from("!I", data, offset + 8)[0]
+            return f1, f2
+        if set_len < 4:
+            break
+        offset += set_len
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +580,147 @@ def run_tests() -> None:
     pkt = make_flow_packet(device_rate=100, seq=201)
     got = tcp_send_and_wait(pkt)
     check("TCP proxy still alive after malformed packet", got is not None)
+
+    # -----------------------------------------------------------------------
+    # NetFlow / IPFIX tests
+    # -----------------------------------------------------------------------
+
+    # Spin up the UDP collector that receives forwarded NF output.
+    nf_collector_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    nf_collector_sock.bind(("127.0.0.1", NF_COLLECTOR_PORT))
+    threading.Thread(
+        target=nf_collector_thread, args=(nf_collector_sock, stop_event), daemon=True
+    ).start()
+
+    nf_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def nf_send_and_wait(pkt: bytes, wait: float = 0.3) -> bytes | None:
+        with lock:
+            nf_received.clear()
+        nf_send_sock.sendto(pkt, (PROXY_HOST, NF_PROXY_PORT))
+        time.sleep(wait)
+        with lock:
+            return nf_received[0] if nf_received else None
+
+    def nf_tcp_send_and_wait(pkt: bytes, wait: float = 0.4) -> bytes | None:
+        with lock:
+            nf_received.clear()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((PROXY_HOST, NF_PROXY_PORT))
+        s.sendall(pkt)
+        s.close()
+        time.sleep(wait)
+        with lock:
+            return nf_received[0] if nf_received else None
+
+    # --- NetFlow v5: downscale ×10 ---------------------------------------
+    print("\n--- NetFlow ---")
+    print("\nNF v5 UDP: downscale (sampling_interval=1000, target=100, scale×10)")
+    got = nf_send_and_wait(build_nf5(sampling_interval=1000, dpkts=1, doctets=1500))
+    if got:
+        fields = parse_nf5_v9_output(got)
+        check("v5→v9 output received",         fields is not None)
+        check("v5 dpkts scaled ×10",           fields is not None and fields[0] == 10,    f"dpkts={fields[0] if fields else '?'}")
+        check("v5 doctets scaled ×10",         fields is not None and fields[1] == 15000, f"doctets={fields[1] if fields else '?'}")
+    else:
+        check("v5 packet received", False, "no packet at collector")
+
+    # --- NetFlow v5: exact match -----------------------------------------
+    print("\nNF v5 UDP: exact match (sampling_interval=100, target=100)")
+    got = nf_send_and_wait(build_nf5(sampling_interval=100, dpkts=5, doctets=7500))
+    if got:
+        fields = parse_nf5_v9_output(got)
+        check("v5 exact match: dpkts unchanged",   fields is not None and fields[0] == 5,    f"dpkts={fields[0] if fields else '?'}")
+        check("v5 exact match: doctets unchanged",  fields is not None and fields[1] == 7500, f"doctets={fields[1] if fields else '?'}")
+    else:
+        check("v5 exact match: packet received", False, "no packet at collector")
+
+    # --- NetFlow v5: default rate (512//100 = 5) -------------------------
+    print("\nNF v5 UDP: default rate (sampling_interval=0 → DEFAULT=512, scale×5)")
+    got = nf_send_and_wait(build_nf5(sampling_interval=0, dpkts=1, doctets=1500))
+    if got:
+        fields = parse_nf5_v9_output(got)
+        expected_ratio = DEFAULT_SAMPLING_RATE // FORWARD_RATE  # 512 // 100 = 5
+        check("v5 default rate: dpkts scaled",   fields is not None and fields[0] == 1 * expected_ratio,    f"dpkts={fields[0] if fields else '?'} ratio={expected_ratio}")
+        check("v5 default rate: doctets scaled", fields is not None and fields[1] == 1500 * expected_ratio, f"doctets={fields[1] if fields else '?'}")
+    else:
+        check("v5 default rate: packet received", False, "no packet at collector")
+
+    # --- NetFlow v9: template + data, downscale --------------------------
+    print("\nNF v9 UDP: template+data (DEFAULT=512, scale×5)")
+    pkt = build_nf9_packet(_NF9_TMPL_ID, _TEST_FIELDS, dpkts=1, doctets=1500)
+    got = nf_send_and_wait(pkt)
+    if got:
+        expected_ratio = DEFAULT_SAMPLING_RATE // FORWARD_RATE
+        fields = parse_nf9_data(got, _NF9_TMPL_ID)
+        check("v9 data flowset present",       fields is not None)
+        check("v9 IN_PKTS scaled",             fields is not None and fields[0] == 1 * expected_ratio,    f"val={fields[0] if fields else '?'} ratio={expected_ratio}")
+        check("v9 IN_BYTES scaled",            fields is not None and fields[1] == 1500 * expected_ratio, f"val={fields[1] if fields else '?'}")
+    else:
+        check("v9 packet received", False, "no packet at collector")
+
+    # --- IPFIX: template + data, downscale --------------------------------
+    print("\nIPFIX UDP: template+data (DEFAULT=512, scale×5)")
+    pkt = build_ipfix_packet(_IPFIX_TMPL_ID, _TEST_FIELDS, dpkts=1, doctets=1500)
+    got = nf_send_and_wait(pkt)
+    if got:
+        expected_ratio = DEFAULT_SAMPLING_RATE // FORWARD_RATE
+        fields = parse_ipfix_data(got, _IPFIX_TMPL_ID)
+        check("IPFIX data set present",        fields is not None)
+        check("IPFIX IN_PKTS scaled",          fields is not None and fields[0] == 1 * expected_ratio,    f"val={fields[0] if fields else '?'} ratio={expected_ratio}")
+        check("IPFIX IN_BYTES scaled",         fields is not None and fields[1] == 1500 * expected_ratio, f"val={fields[1] if fields else '?'}")
+    else:
+        check("IPFIX packet received", False, "no packet at collector")
+
+    # -----------------------------------------------------------------------
+    # NetFlow TCP tests
+    # -----------------------------------------------------------------------
+    print("\n--- NetFlow TCP ---")
+
+    # --- NetFlow v9 TCP: template + data, downscale ----------------------
+    print("\nNF v9 TCP: template+data (DEFAULT=512, scale×5)")
+    pkt = build_nf9_packet(_NF9_TMPL_ID, _TEST_FIELDS, dpkts=2, doctets=3000)
+    got = nf_tcp_send_and_wait(pkt)
+    if got:
+        expected_ratio = DEFAULT_SAMPLING_RATE // FORWARD_RATE
+        fields = parse_nf9_data(got, _NF9_TMPL_ID)
+        check("v9 TCP data flowset present",   fields is not None)
+        check("v9 TCP IN_PKTS scaled",         fields is not None and fields[0] == 2 * expected_ratio,    f"val={fields[0] if fields else '?'} ratio={expected_ratio}")
+        check("v9 TCP IN_BYTES scaled",        fields is not None and fields[1] == 3000 * expected_ratio, f"val={fields[1] if fields else '?'}")
+    else:
+        check("v9 TCP packet received", False, "no packet at collector")
+
+    # --- IPFIX TCP: template + data, downscale ----------------------------
+    print("\nIPFIX TCP: template+data (DEFAULT=512, scale×5)")
+    pkt = build_ipfix_packet(_IPFIX_TMPL_ID, _TEST_FIELDS, dpkts=2, doctets=3000)
+    got = nf_tcp_send_and_wait(pkt)
+    if got:
+        expected_ratio = DEFAULT_SAMPLING_RATE // FORWARD_RATE
+        fields = parse_ipfix_data(got, _IPFIX_TMPL_ID)
+        check("IPFIX TCP data set present",    fields is not None)
+        check("IPFIX TCP IN_PKTS scaled",      fields is not None and fields[0] == 2 * expected_ratio,    f"val={fields[0] if fields else '?'} ratio={expected_ratio}")
+        check("IPFIX TCP IN_BYTES scaled",     fields is not None and fields[1] == 3000 * expected_ratio, f"val={fields[1] if fields else '?'}")
+    else:
+        check("IPFIX TCP packet received", False, "no packet at collector")
+
+    # --- NetFlow TCP: malformed (drop + no crash) -------------------------
+    print("\nNF TCP: malformed packet (drop + no crash)")
+    with lock:
+        nf_received.clear()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((PROXY_HOST, NF_PROXY_PORT))
+    # Send bytes that look like NF v9 (version=9, count=1) followed by a
+    # FlowSet header with fs_len=2 (< 4, invalid) to trigger ValueError.
+    bad = struct.pack("!HHIIII", 9, 1, 0, 0, 0, 0) + struct.pack("!HH", 256, 2)
+    s.sendall(bad)
+    s.close()
+    # Proxy should drop and keep serving; verify with a valid follow-up packet.
+    pkt = build_nf9_packet(_NF9_TMPL_ID, _TEST_FIELDS, dpkts=1, doctets=1500)
+    got = nf_tcp_send_and_wait(pkt)
+    check("NF TCP proxy alive after malformed packet", got is not None)
+
+    nf_send_sock.close()
+    nf_collector_sock.close()
 
     # --- Summary --------------------------------------------------------
     stop_event.set()

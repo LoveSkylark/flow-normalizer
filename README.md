@@ -168,9 +168,27 @@ asyncio event loop
 
 ## Tests
 
+Start the proxy, then run the harness:
+
 ```sh id="q1v4mt"
-# run proxy
-# run test_sender.py
+# Terminal 1
+FORWARD_IP=127.0.0.1 FORWARD_RATE=100 DEFAULT_SAMPLING_RATE=512 \
+  SFLOW_FORWARD_PORT=16343 NETFLOW_FORWARD_PORT=16055 \
+  python proxy.py
+
+# Terminal 2
+python test_sender.py 6343 16343 "" 2055 16055
 ```
 
-Covers scaling, missing rates, TCP/UDP paths, and malformed input.
+The harness covers:
+
+| Area | Scenarios |
+| ---- | --------- |
+| sFlow UDP | Probabilistic drop (rate < target), count scale-up (rate > target), missing rate → default, exact match, counter pass-through, malformed packet |
+| sFlow TCP | Count scale-up, counter pass-through, malformed frame |
+| NetFlow v5 UDP | Count scale-up (×10), exact match, missing rate → default (DEFAULT_SAMPLING_RATE) |
+| NetFlow v9 UDP | Template + data, count scale-up |
+| IPFIX UDP | Template + data, count scale-up |
+| NetFlow v9 TCP | Template + data over TCP, count scale-up |
+| IPFIX TCP | Template + data over TCP, count scale-up |
+| NetFlow TCP | Malformed frame, proxy survives |

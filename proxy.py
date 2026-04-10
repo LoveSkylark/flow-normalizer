@@ -30,11 +30,20 @@ def _load_device_rates() -> dict[str, int]:
         entry = entry.strip()
         if not entry:
             continue
-        parts = entry.split(":")
-        if len(parts) != 2:
-            print(f"device_rates: skipping invalid entry {entry!r} (expected ip:rate)", file=sys.stderr)
-            continue
-        ip, rate_str = parts[0].strip(), parts[1].strip()
+        # IPv6 addresses must be in bracket notation: [::1]:1000
+        if entry.startswith("["):
+            bracket_end = entry.find("]")
+            if bracket_end == -1 or not entry[bracket_end + 1:bracket_end + 2] == ":":
+                print(f"device_rates: skipping invalid IPv6 entry {entry!r} (expected [addr]:rate)", file=sys.stderr)
+                continue
+            ip = entry[1:bracket_end]
+            rate_str = entry[bracket_end + 2:]
+        else:
+            parts = entry.split(":")
+            if len(parts) != 2:
+                print(f"device_rates: skipping invalid entry {entry!r} (expected ip:rate)", file=sys.stderr)
+                continue
+            ip, rate_str = parts[0].strip(), parts[1].strip()
         try:
             rates[ip] = int(rate_str)
         except ValueError:
@@ -59,6 +68,15 @@ _fwd_last_seen: dict[str, float] = {}
 # Per-source UDP sockets used when SPOOF_UDP_SOURCE is enabled.
 _udp_spoof_socks: dict[str, socket.socket] = {}
 
+# Maximum number of entries in any per-source cache dict before the oldest is evicted.
+_CACHE_MAXSIZE = 1000
+
+
+def _maybe_evict(d: dict) -> None:
+    """Remove the oldest (first-inserted) entry when d is at capacity."""
+    if len(d) >= _CACHE_MAXSIZE:
+        d.pop(next(iter(d)))
+
 
 def _get_udp_spoof_sock(src_ip: str) -> socket.socket:
     """Return a UDP socket bound to src_ip via IP_TRANSPARENT, cached per source IP.
@@ -66,10 +84,15 @@ def _get_udp_spoof_sock(src_ip: str) -> socket.socket:
     IP_TRANSPARENT lets the socket bind to a non-local address so the forwarded
     packet reaches the collector with the original device IP as its UDP source,
     rather than this host's IP.  Requires CAP_NET_ADMIN.
+    Supports both IPv4 and IPv6 source addresses.
     """
     sock = _udp_spoof_socks.get(src_ip)
     if sock is None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if len(_udp_spoof_socks) >= _CACHE_MAXSIZE:
+            old_ip = next(iter(_udp_spoof_socks))
+            _udp_spoof_socks.pop(old_ip).close()
+        family = socket.AF_INET6 if ":" in src_ip else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_IP, _IP_TRANSPARENT, 1)
         sock.bind((src_ip, 0))
         _udp_spoof_socks[src_ip] = sock
@@ -157,8 +180,36 @@ _SCALE_MAX: dict[int, int] = {2: 0xFFFF, 4: 0xFFFF_FFFF, 8: 0xFFFF_FFFF_FFFF_FFF
 # Maximum NetFlow/IPFIX message size accepted over TCP (sanity cap).
 _NF_MAX_MSG = 65535
 
+# Maximum number of FlowSets allowed per NetFlow v9 TCP message.
+# A malicious sender could advertise count=65535 and force 65535 read iterations;
+# cap at a safe upper bound (typical packets carry fewer than 100 FlowSets).
+_NF_MAX_FLOWSETS = 1000
+
 
 # ─── sFlow processing ─────────────────────────────────────────────────────────
+
+def _sflow_agent(data: bytes) -> tuple[str | None, int]:
+    """Return (agent_ip_string, header_size) for an sFlow v5 datagram.
+
+    sFlow header size depends on the agent address type:
+      addr_type=1 → IPv4 (4-byte address)  → 28-byte header
+      addr_type=2 → IPv6 (16-byte address) → 40-byte header
+
+    Returns (None, 28) if the datagram is too short or the address type is unknown.
+    The header_size is always valid so callers can safely use it for offset arithmetic.
+    """
+    if len(data) < 8:
+        return None, DATAGRAM_HEADER_SIZE
+    addr_type = struct.unpack_from("!I", data, 4)[0]
+    if addr_type == 1:  # IPv4
+        if len(data) >= 12:
+            return socket.inet_ntoa(data[8:12]), 28
+        return None, 28
+    if addr_type == 2:  # IPv6
+        if len(data) >= 24:
+            return socket.inet_ntop(socket.AF_INET6, data[8:24]), 40
+        return None, 40
+    return None, DATAGRAM_HEADER_SIZE
 
 def _maybe_log_sflow_source(data: bytes, transport: str) -> None:
     """Log a sFlow source on first appearance and again after SOURCE_LOG_INTERVAL silence.
@@ -166,28 +217,31 @@ def _maybe_log_sflow_source(data: bytes, transport: str) -> None:
     Reads the raw datagram before any normalization so the log reflects exactly
     what the device is sending.
     """
-    if len(data) < DATAGRAM_HEADER_SIZE:
-        return
-    if struct.unpack_from("!I", data, 4)[0] != 1:  # only IPv4 agent addresses
+    agent_ip, hdr_size = _sflow_agent(data)
+    if agent_ip is None or len(data) < hdr_size:
         return
 
-    agent_ip = socket.inet_ntoa(data[8:12])
     now = time.monotonic()
     last = _source_last_seen.get(agent_ip)
     if last is not None and now - last < SOURCE_LOG_INTERVAL:
         return
+    if agent_ip not in _source_last_seen:
+        _maybe_evict(_source_last_seen)
     _source_last_seen[agent_ip] = now
 
     label = "NEW_SOURCE" if last is None else "SOURCE_REAPPEARED"
 
-    sub_agent_id = struct.unpack_from("!I", data, 12)[0]
-    seq           = struct.unpack_from("!I", data, 16)[0]
-    num_samples   = struct.unpack_from("!I", data, 24)[0]
+    # sFlow header offsets are relative to hdr_size (varies with addr_type).
+    # IPv4 hdr=28: sub_agent_id=12, seq=16, num_samples=24
+    # IPv6 hdr=40: sub_agent_id=24, seq=28, num_samples=36
+    sub_agent_id = struct.unpack_from("!I", data, hdr_size - 16)[0]
+    seq           = struct.unpack_from("!I", data, hdr_size - 12)[0]
+    num_samples   = struct.unpack_from("!I", data, hdr_size - 4)[0]
 
     # Walk samples to tally types and grab the first embedded flow rate.
     flow_count = counter_count = 0
     embedded_rate: int | None = None
-    offset = DATAGRAM_HEADER_SIZE
+    offset = hdr_size
     for _ in range(num_samples):
         if offset + 8 > len(data):
             break
@@ -237,20 +291,20 @@ def _maybe_log_sflow_source(data: bytes, transport: str) -> None:
 
 def _maybe_log_sflow_forward(packet: bytes, transport: str) -> None:
     """Log a forwarded sFlow packet, rate-limited per agent by SOURCE_LOG_INTERVAL."""
-    if len(packet) < DATAGRAM_HEADER_SIZE:
-        return
-    if struct.unpack_from("!I", packet, 4)[0] != 1:  # only IPv4 agent addresses
+    agent_ip, hdr_size = _sflow_agent(packet)
+    if agent_ip is None or len(packet) < hdr_size:
         return
 
-    agent_ip = socket.inet_ntoa(packet[8:12])
     now = time.monotonic()
     last = _fwd_last_seen.get(agent_ip)
     if last is not None and now - last < SOURCE_LOG_INTERVAL:
         return
+    if agent_ip not in _fwd_last_seen:
+        _maybe_evict(_fwd_last_seen)
     _fwd_last_seen[agent_ip] = now
 
-    seq         = struct.unpack_from("!I", packet, 16)[0]
-    num_samples = struct.unpack_from("!I", packet, 24)[0]
+    seq         = struct.unpack_from("!I", packet, hdr_size - 12)[0]
+    num_samples = struct.unpack_from("!I", packet, hdr_size - 4)[0]
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     print(
         f"{ts} SFLOW_FORWARDED agent={agent_ip} transport={transport}"
@@ -316,17 +370,14 @@ def _parse_sflow_datagram(data: bytes) -> bytes | None:
         raise ValueError(f"Unsupported sFlow version: {version}")
 
     # Extract agent_address for per-device rate table lookup.
-    # Header layout: version(4) addr_type(4) addr_ip(4) ...
-    # addr_type=1 means IPv4; addr_ip is the 4 raw bytes at offset 8.
-    agent_ip: str | None = None
-    if struct.unpack_from("!I", data, 4)[0] == 1:  # IPv4
-        agent_ip = socket.inet_ntoa(data[8:12])
+    # hdr_size varies: 28 for IPv4 agents, 40 for IPv6 agents.
+    agent_ip, hdr_size = _sflow_agent(data)
 
-    num_samples = struct.unpack_from("!I", data, 24)[0]
+    num_samples = struct.unpack_from("!I", data, hdr_size - 4)[0]
 
-    hdr   = bytearray(data[:DATAGRAM_HEADER_SIZE])
+    hdr   = bytearray(data[:hdr_size])
     parts: list[bytes | bytearray] = []
-    offset     = DATAGRAM_HEADER_SIZE
+    offset     = hdr_size
     out_samples = 0
 
     for _ in range(num_samples):
@@ -357,7 +408,7 @@ def _parse_sflow_datagram(data: bytes) -> bytes | None:
     if out_samples == 0:
         return None  # nothing left to forward
 
-    struct.pack_into("!I", hdr, 24, out_samples)
+    struct.pack_into("!I", hdr, hdr_size - 4, out_samples)
     return bytes(hdr) + b"".join(parts)
 
 
@@ -386,6 +437,8 @@ def _maybe_log_nf_source(data: bytes, src_ip: str, transport: str = "UDP") -> No
     last = _source_last_seen.get(src_ip)
     if last is not None and now - last < SOURCE_LOG_INTERVAL:
         return
+    if src_ip not in _source_last_seen:
+        _maybe_evict(_source_last_seen)
     _source_last_seen[src_ip] = now
 
     label = "NF_NEW_SOURCE" if last is None else "NF_SOURCE_REAPPEARED"
@@ -450,6 +503,8 @@ def _maybe_log_nf_forward(packet: bytes, src_ip: str, transport: str = "UDP") ->
     last = _fwd_last_seen.get(src_ip)
     if last is not None and now - last < SOURCE_LOG_INTERVAL:
         return
+    if src_ip not in _fwd_last_seen:
+        _maybe_evict(_fwd_last_seen)
     _fwd_last_seen[src_ip] = now
 
     version = struct.unpack_from("!H", packet, 0)[0]
@@ -475,6 +530,8 @@ def _cache_nf9_templates(
     data: bytes, start: int, end: int, src_ip: str, domain_id: int
 ) -> None:
     """Parse v9 Template FlowSet records in data[start:end] and update _tmpl_cache."""
+    if src_ip not in _tmpl_cache:
+        _maybe_evict(_tmpl_cache)
     domain = _tmpl_cache.setdefault(src_ip, {}).setdefault(domain_id, {})
     off = start
     while off + 4 <= end:
@@ -500,6 +557,8 @@ def _cache_ipfix_templates(
     Enterprise-specific fields (bit 15 of field type = 1) consume an extra
     4-byte enterprise ID; the stripped type (bit 15 cleared) is cached.
     """
+    if src_ip not in _tmpl_cache:
+        _maybe_evict(_tmpl_cache)
     domain = _tmpl_cache.setdefault(src_ip, {}).setdefault(domain_id, {})
     off = start
     while off + 4 <= end:
@@ -851,6 +910,8 @@ async def _read_nf_tcp_frame(reader: asyncio.StreamReader) -> bytes:
 
     if version == 9:  # NetFlow v9 — second word is FlowSet count, no total length
         count    = second
+        if count > _NF_MAX_FLOWSETS:
+            raise ValueError(f"NetFlow v9 FlowSet count exceeds limit ({count} > {_NF_MAX_FLOWSETS})")
         hdr_rest = await reader.readexactly(16)  # uptime(4) unix_secs(4) pkg_seq(4) source_id(4)
         parts: list[bytes] = [hdr, hdr_rest]
         for _ in range(count):
