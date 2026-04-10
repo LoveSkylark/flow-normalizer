@@ -103,12 +103,6 @@ cp .env.example .env
 docker compose up -d
 ```
 
-### Python
-
-```sh id="9a7cql"
-FORWARD_IP=192.168.1.10 python3 proxy.py
-```
-
 No dependencies.
 
 ---
