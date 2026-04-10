@@ -143,11 +143,25 @@ _V9_TMPL_FLOWSET = _build_v9_template_flowset()
 # Template cache: src_ip → domain_id → template_id → [(field_type, field_length)]
 _tmpl_cache: dict[str, dict[int, dict[int, list[tuple[int, int]]]]] = {}
 
+# Frozenset for O(1) membership test in hot-path field scanning.
+_NF_SCALE_TYPES = frozenset({_NF_IN_PKTS, _NF_IN_BYTES, _NF_OUT_PKTS, _NF_OUT_BYTES})
 
-# ─── sFlow helpers ────────────────────────────────────────────────────────────
+# Struct and max-value lookup for fast counter scaling of common field widths.
+_SCALE_STRUCT: dict[int, struct.Struct] = {
+    2: struct.Struct("!H"),
+    4: struct.Struct("!I"),
+    8: struct.Struct("!Q"),
+}
+_SCALE_MAX: dict[int, int] = {2: 0xFFFF, 4: 0xFFFF_FFFF, 8: 0xFFFF_FFFF_FFFF_FFFF}
 
-def _maybe_log_source(data: bytes, transport: str) -> None:
-    """Log a source on first appearance and again after SOURCE_LOG_INTERVAL silence.
+# Maximum NetFlow/IPFIX message size accepted over TCP (sanity cap).
+_NF_MAX_MSG = 65535
+
+
+# ─── sFlow processing ─────────────────────────────────────────────────────────
+
+def _maybe_log_sflow_source(data: bytes, transport: str) -> None:
+    """Log a sFlow source on first appearance and again after SOURCE_LOG_INTERVAL silence.
 
     Reads the raw datagram before any normalization so the log reflects exactly
     what the device is sending.
@@ -246,7 +260,7 @@ def _maybe_log_sflow_forward(packet: bytes, transport: str) -> None:
     )
 
 
-def normalize_flow_sample(data: bytes, agent_ip: str | None = None) -> bytes | None:
+def _normalize_sflow_sample(data: bytes, agent_ip: str | None = None) -> bytes | None:
     # Flow sample layout (offsets within sample_data):
     #   0: sequence_number  uint32
     #   4: source_id        uint32
@@ -293,7 +307,7 @@ def normalize_flow_sample(data: bytes, agent_ip: str | None = None) -> bytes | N
     return bytes(data)
 
 
-def parse_datagram(data: bytes) -> bytes | None:
+def _parse_sflow_datagram(data: bytes) -> bytes | None:
     if len(data) < DATAGRAM_HEADER_SIZE:
         raise ValueError(f"Datagram too short: {len(data)} bytes")
 
@@ -310,8 +324,9 @@ def parse_datagram(data: bytes) -> bytes | None:
 
     num_samples = struct.unpack_from("!I", data, 24)[0]
 
-    out = bytearray(data[:DATAGRAM_HEADER_SIZE])
-    offset = DATAGRAM_HEADER_SIZE
+    hdr   = bytearray(data[:DATAGRAM_HEADER_SIZE])
+    parts: list[bytes | bytearray] = []
+    offset     = DATAGRAM_HEADER_SIZE
     out_samples = 0
 
     for _ in range(num_samples):
@@ -320,7 +335,7 @@ def parse_datagram(data: bytes) -> bytes | None:
 
         sample_type, sample_length = struct.unpack_from("!II", data, offset)
         record_header = data[offset : offset + 8]
-        sample_data = data[offset + 8 : offset + 8 + sample_length]
+        sample_data   = data[offset + 8 : offset + 8 + sample_length]
 
         if len(sample_data) < sample_length:
             raise ValueError(
@@ -328,22 +343,22 @@ def parse_datagram(data: bytes) -> bytes | None:
             )
 
         if sample_type == SAMPLE_TYPE_FLOW:
-            sample_data = normalize_flow_sample(sample_data, agent_ip)
+            sample_data = _normalize_sflow_sample(sample_data, agent_ip)
             if sample_data is None:
                 offset += 8 + sample_length
                 continue  # probabilistically dropped
             record_header = struct.pack("!II", sample_type, len(sample_data))
 
-        out += record_header
-        out += sample_data
+        parts.append(record_header)
+        parts.append(sample_data)
         out_samples += 1
         offset += 8 + sample_length
 
     if out_samples == 0:
         return None  # nothing left to forward
 
-    struct.pack_into("!I", out, 24, out_samples)
-    return bytes(out)
+    struct.pack_into("!I", hdr, 24, out_samples)
+    return bytes(hdr) + b"".join(parts)
 
 
 # ─── NetFlow processing ───────────────────────────────────────────────────────
@@ -529,40 +544,52 @@ def _normalize_data_flowset(
     scale_fields: list[tuple[int, int]] = []
     rec_off = 0
     for ftype, flen in fields:
-        if ftype in (_NF_IN_PKTS, _NF_IN_BYTES, _NF_OUT_PKTS, _NF_OUT_BYTES):
+        if ftype in _NF_SCALE_TYPES:
             scale_fields.append((rec_off, flen))
         rec_off += flen
 
-    out_records = bytearray()
-    offset = 4   # skip 4-byte FlowSet header
-    end = len(flowset)
+    # Hoist all loop invariants out of the inner loop.
+    do_drop     = device_rate < FORWARD_RATE
+    drop_thresh = device_rate / FORWARD_RATE if do_drop else 0.0
+    do_scale    = device_rate > FORWARD_RATE and bool(scale_fields)
+    ratio       = device_rate // FORWARD_RATE if do_scale else 0
+
+    out_parts: list[bytes | bytearray] = []
+    out_len = 0
+    offset  = 4   # skip 4-byte FlowSet header
+    end     = len(flowset)
 
     while offset + record_size <= end:
-        record = bytearray(flowset[offset : offset + record_size])
+        if do_drop and random.random() >= drop_thresh:
+            offset += record_size
+            continue  # probabilistically dropped
 
-        if device_rate < FORWARD_RATE:
-            if random.random() >= device_rate / FORWARD_RATE:
-                offset += record_size
-                continue  # probabilistically dropped
-
-        if device_rate > FORWARD_RATE and scale_fields:
-            ratio = device_rate // FORWARD_RATE
+        if do_scale:
+            record = bytearray(flowset[offset : offset + record_size])
             for foff, flen in scale_fields:
-                val = int.from_bytes(record[foff : foff + flen], "big")
-                val = min(val * ratio, (1 << (flen * 8)) - 1)
-                record[foff : foff + flen] = val.to_bytes(flen, "big")
+                sc = _SCALE_STRUCT.get(flen)
+                if sc:
+                    val = min(sc.unpack_from(record, foff)[0] * ratio, _SCALE_MAX[flen])
+                    sc.pack_into(record, foff, val)
+                else:
+                    val = int.from_bytes(record[foff : foff + flen], "big")
+                    val = min(val * ratio, (1 << (flen * 8)) - 1)
+                    record[foff : foff + flen] = val.to_bytes(flen, "big")
+            out_parts.append(bytes(record))
+        else:
+            out_parts.append(flowset[offset : offset + record_size])
 
-        out_records += record
-        offset += record_size
+        out_len += record_size
+        offset  += record_size
 
-    if not out_records:
+    if not out_parts:
         return None
 
-    pad = (-len(out_records)) & 3
-    total = 4 + len(out_records) + pad
-    hdr = bytearray(flowset[:4])
+    pad   = (-out_len) & 3
+    total = 4 + out_len + pad
+    hdr   = bytearray(flowset[:4])
     struct.pack_into("!H", hdr, 2, total)
-    return bytes(hdr) + bytes(out_records) + bytes(pad)
+    return bytes(hdr) + b"".join(out_parts) + bytes(pad)
 
 
 def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
@@ -589,6 +616,10 @@ def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
 
     device_rate = _nf_device_rate(src_ip, sampling_int & 0x3FFF)
 
+    do_drop     = device_rate < FORWARD_RATE
+    drop_thresh = device_rate / FORWARD_RATE if do_drop else 0.0
+    scale_ratio = device_rate // FORWARD_RATE if device_rate > FORWARD_RATE else 0
+
     out_records: list[bytes] = []
     for i in range(count):
         srcaddr, dstaddr, nexthop, inp, outp, dpkts, doctets, \
@@ -596,14 +627,12 @@ def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
             src_as, dst_as, src_mask, dst_mask = \
             _NF5_REC.unpack_from(data, _NF5_HDR.size + i * _NF5_REC.size)
 
-        if device_rate < FORWARD_RATE:
-            if random.random() >= device_rate / FORWARD_RATE:
-                continue  # probabilistically dropped
+        if do_drop and random.random() >= drop_thresh:
+            continue  # probabilistically dropped
 
-        if device_rate > FORWARD_RATE:
-            ratio = device_rate // FORWARD_RATE
-            dpkts   = min(dpkts   * ratio, 0xFFFF_FFFF)
-            doctets = min(doctets * ratio, 0xFFFF_FFFF)
+        if scale_ratio:
+            dpkts   = min(dpkts   * scale_ratio, 0xFFFF_FFFF)
+            doctets = min(doctets * scale_ratio, 0xFFFF_FFFF)
 
         out_records.append(_V5_DATA_REC.pack(
             srcaddr, dstaddr, nexthop, inp, outp,
@@ -751,9 +780,9 @@ class SFlowProtocol(asyncio.DatagramProtocol):
         self._sock = forward_sock
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
-        _maybe_log_source(data, "UDP")
+        _maybe_log_sflow_source(data, "UDP")
         try:
-            packet = parse_datagram(data)
+            packet = _parse_sflow_datagram(data)
         except Exception as exc:
             print(
                 f"DROP {addr[0]} len={len(data)}: {exc}",
@@ -816,21 +845,22 @@ async def _read_nf_tcp_frame(reader: asyncio.StreamReader) -> bytes:
 
     if version == 10:  # IPFIX — second word is total message length (includes header)
         remaining = second - 4
-        if remaining < 0:
-            raise ValueError(f"IPFIX message length too short: {second}")
+        if not (0 <= remaining <= _NF_MAX_MSG):
+            raise ValueError(f"IPFIX message length out of range: {second}")
         return hdr + await reader.readexactly(remaining)
 
     if version == 9:  # NetFlow v9 — second word is FlowSet count, no total length
-        count = second
+        count    = second
         hdr_rest = await reader.readexactly(16)  # uptime(4) unix_secs(4) pkg_seq(4) source_id(4)
-        body = bytearray()
+        parts: list[bytes] = [hdr, hdr_rest]
         for _ in range(count):
             fs_hdr = await reader.readexactly(4)
             fs_len = struct.unpack_from("!H", fs_hdr, 2)[0]
-            if fs_len < 4:
-                raise ValueError(f"NetFlow v9 FlowSet length too short: {fs_len}")
-            body += fs_hdr + await reader.readexactly(fs_len - 4)
-        return hdr + hdr_rest + bytes(body)
+            if not (4 <= fs_len <= _NF_MAX_MSG):
+                raise ValueError(f"NetFlow v9 FlowSet length invalid: {fs_len}")
+            parts.append(fs_hdr)
+            parts.append(await reader.readexactly(fs_len - 4))
+        return b"".join(parts)
 
     raise ValueError(f"Unsupported NetFlow version over TCP: {version}")
 
@@ -854,9 +884,9 @@ async def handle_tcp_connection(
             except asyncio.IncompleteReadError:
                 break  # clean disconnect
 
-            _maybe_log_source(data, "TCP")
+            _maybe_log_sflow_source(data, "TCP")
             try:
-                packet = parse_datagram(data)
+                packet = _parse_sflow_datagram(data)
             except Exception as exc:
                 print(
                     f"DROP TCP {peer[0]} len={len(data)}: {exc}",
