@@ -47,6 +47,7 @@ DEVICE_RATES: dict[str, int] = _load_device_rates()
 # How long a source must be silent before it is logged again (seconds).
 SOURCE_LOG_INTERVAL = int(os.environ.get("SOURCE_LOG_INTERVAL", 300))
 _source_last_seen: dict[str, float] = {}
+_fwd_last_seen: dict[str, float] = {}
 
 DATAGRAM_HEADER_SIZE = 28
 SAMPLE_TYPE_FLOW = 1
@@ -190,6 +191,31 @@ def _maybe_log_source(data: bytes, transport: str) -> None:
         f" sub_agent_id={sub_agent_id} seq={seq}"
         f" flow_samples={flow_count} counter_samples={counter_count}"
         f" {rate_info}",
+        flush=True,
+    )
+
+
+def _maybe_log_sflow_forward(packet: bytes, transport: str) -> None:
+    """Log a forwarded sFlow packet, rate-limited per agent by SOURCE_LOG_INTERVAL."""
+    if len(packet) < DATAGRAM_HEADER_SIZE:
+        return
+    if struct.unpack_from("!I", packet, 4)[0] != 1:  # only IPv4 agent addresses
+        return
+
+    agent_ip = socket.inet_ntoa(packet[8:12])
+    now = time.monotonic()
+    last = _fwd_last_seen.get(agent_ip)
+    if last is not None and now - last < SOURCE_LOG_INTERVAL:
+        return
+    _fwd_last_seen[agent_ip] = now
+
+    seq         = struct.unpack_from("!I", packet, 16)[0]
+    num_samples = struct.unpack_from("!I", packet, 24)[0]
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    print(
+        f"{ts} SFLOW_FORWARDED agent={agent_ip} transport={transport}"
+        f" dst={FORWARD_IP}:{SFLOW_FORWARD_PORT}"
+        f" seq={seq} samples={num_samples} len={len(packet)}",
         flush=True,
     )
 
@@ -372,6 +398,36 @@ def _maybe_log_nf_source(data: bytes, src_ip: str) -> None:
         return  # unknown version — parse_netflow will raise, skip logging
 
     print(f"{ts} {label} src={src_ip} version={version}{extra}", flush=True)
+
+
+def _maybe_log_nf_forward(packet: bytes, src_ip: str) -> None:
+    """Log a forwarded NetFlow/IPFIX packet, rate-limited per source by SOURCE_LOG_INTERVAL."""
+    if len(packet) < 2:
+        return
+
+    now = time.monotonic()
+    last = _fwd_last_seen.get(src_ip)
+    if last is not None and now - last < SOURCE_LOG_INTERVAL:
+        return
+    _fwd_last_seen[src_ip] = now
+
+    version = struct.unpack_from("!H", packet, 0)[0]
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    if version == 9 and len(packet) >= 20:
+        _, count, _, _, pkg_seq, source_id = struct.unpack_from("!HHIIII", packet, 0)
+        print(
+            f"{ts} NF_FORWARDED src={src_ip} dst={FORWARD_IP}:{NETFLOW_FORWARD_PORT}"
+            f" version=9 records={count} seq={pkg_seq} source_id={source_id} len={len(packet)}",
+            flush=True,
+        )
+    elif version == 10 and len(packet) >= 16:
+        _, msg_len, _, seq_num, obs_domain_id = struct.unpack_from("!HHIII", packet, 0)
+        print(
+            f"{ts} NF_FORWARDED src={src_ip} dst={FORWARD_IP}:{NETFLOW_FORWARD_PORT}"
+            f" version=10 msg_len={msg_len} seq={seq_num} obs_domain_id={obs_domain_id} len={len(packet)}",
+            flush=True,
+        )
 
 
 def _cache_nf9_templates(
@@ -681,6 +737,7 @@ class SFlowProtocol(asyncio.DatagramProtocol):
             return
         if packet is not None:
             self._sock.sendto(packet, (FORWARD_IP, SFLOW_FORWARD_PORT))
+            _maybe_log_sflow_forward(packet, "UDP")
 
     def error_received(self, exc: Exception) -> None:
         print(f"Socket error: {exc}", file=sys.stderr, flush=True)
@@ -703,6 +760,7 @@ class NetFlowProtocol(asyncio.DatagramProtocol):
             return
         if packet is not None:
             self._sock.sendto(packet, (FORWARD_IP, NETFLOW_FORWARD_PORT))
+            _maybe_log_nf_forward(packet, addr[0])
 
     def error_received(self, exc: Exception) -> None:
         print(f"NetFlow socket error: {exc}", file=sys.stderr, flush=True)
@@ -746,6 +804,7 @@ async def handle_tcp_connection(
             if packet is not None:
                 fwd_writer.write(_TCP_FRAME.pack(len(packet)) + packet)
                 await fwd_writer.drain()
+                _maybe_log_sflow_forward(packet, "TCP")
     except Exception as exc:
         print(f"TCP {peer[0]}: {exc}", file=sys.stderr, flush=True)
     finally:
