@@ -10,4 +10,7 @@ services:
       - "${SFLOW_PORT:-6343}:6343/udp"
       - "${SFLOW_PORT:-6343}:6343/tcp"
       - "${NETFLOW_LISTEN_PORT:-2055}:2055/udp"
+    # Required when SPOOF_UDP_SOURCE=true — allows binding to non-local source IPs.
+    # cap_add:
+    #   - NET_ADMIN
     restart: unless-stopped

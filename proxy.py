@@ -44,10 +44,36 @@ def _load_device_rates() -> dict[str, int]:
 
 DEVICE_RATES: dict[str, int] = _load_device_rates()
 
+# When true, forwarded UDP packets are sent with the original device's source IP
+# instead of this host's IP, so the downstream collector sees the real exporter.
+# UDP only — TCP transparent proxying requires kernel-level TPROXY (not implemented).
+# Requires CAP_NET_ADMIN; add to docker-compose.yml: cap_add: [NET_ADMIN]
+SPOOF_UDP_SOURCE = os.environ.get("SPOOF_UDP_SOURCE", "").lower() in ("1", "true", "yes")
+_IP_TRANSPARENT = getattr(socket, "IP_TRANSPARENT", 19)  # Linux constant = 19
+
 # How long a source must be silent before it is logged again (seconds).
 SOURCE_LOG_INTERVAL = int(os.environ.get("SOURCE_LOG_INTERVAL", 300))
 _source_last_seen: dict[str, float] = {}
 _fwd_last_seen: dict[str, float] = {}
+
+# Per-source UDP sockets used when SPOOF_UDP_SOURCE is enabled.
+_udp_spoof_socks: dict[str, socket.socket] = {}
+
+
+def _get_udp_spoof_sock(src_ip: str) -> socket.socket:
+    """Return a UDP socket bound to src_ip via IP_TRANSPARENT, cached per source IP.
+
+    IP_TRANSPARENT lets the socket bind to a non-local address so the forwarded
+    packet reaches the collector with the original device IP as its UDP source,
+    rather than this host's IP.  Requires CAP_NET_ADMIN.
+    """
+    sock = _udp_spoof_socks.get(src_ip)
+    if sock is None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_IP, _IP_TRANSPARENT, 1)
+        sock.bind((src_ip, 0))
+        _udp_spoof_socks[src_ip] = sock
+    return sock
 
 DATAGRAM_HEADER_SIZE = 28
 SAMPLE_TYPE_FLOW = 1
@@ -736,7 +762,10 @@ class SFlowProtocol(asyncio.DatagramProtocol):
             )
             return
         if packet is not None:
-            self._sock.sendto(packet, (FORWARD_IP, SFLOW_FORWARD_PORT))
+            if SPOOF_UDP_SOURCE:
+                _get_udp_spoof_sock(addr[0]).sendto(packet, (FORWARD_IP, SFLOW_FORWARD_PORT))
+            else:
+                self._sock.sendto(packet, (FORWARD_IP, SFLOW_FORWARD_PORT))
             _maybe_log_sflow_forward(packet, "UDP")
 
     def error_received(self, exc: Exception) -> None:
@@ -759,7 +788,10 @@ class NetFlowProtocol(asyncio.DatagramProtocol):
             )
             return
         if packet is not None:
-            self._sock.sendto(packet, (FORWARD_IP, NETFLOW_FORWARD_PORT))
+            if SPOOF_UDP_SOURCE:
+                _get_udp_spoof_sock(addr[0]).sendto(packet, (FORWARD_IP, NETFLOW_FORWARD_PORT))
+            else:
+                self._sock.sendto(packet, (FORWARD_IP, NETFLOW_FORWARD_PORT))
             _maybe_log_nf_forward(packet, addr[0])
 
     def error_received(self, exc: Exception) -> None:
@@ -821,6 +853,19 @@ async def handle_tcp_connection(
 
 
 async def main() -> None:
+    if SPOOF_UDP_SOURCE:
+        try:
+            _test = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _test.setsockopt(socket.SOL_IP, _IP_TRANSPARENT, 1)
+            _test.close()
+        except OSError as exc:
+            print(
+                f"SPOOF_UDP_SOURCE=true but IP_TRANSPARENT failed: {exc}\n"
+                f"  → Add 'cap_add: [NET_ADMIN]' to the Docker service.",
+                file=sys.stderr, flush=True,
+            )
+            sys.exit(1)
+
     forward_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     nf_forward_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -842,17 +887,18 @@ async def main() -> None:
     )
 
     override_info = f" device_overrides={len(DEVICE_RATES)}" if DEVICE_RATES else ""
+    spoof_info = " udp_src_spoof=on" if SPOOF_UDP_SOURCE else ""
     print(
         f"flow-normalizer sflow listening on :{SFLOW_PORT} (UDP+TCP) "
         f"→ {FORWARD_IP}:{SFLOW_FORWARD_PORT} "
         f"forward_rate={FORWARD_RATE} default_rate={DEFAULT_SAMPLING_RATE}"
-        f"{override_info}",
+        f"{override_info}{spoof_info}",
         flush=True,
     )
     print(
         f"netflow-normalizer listening on :{NETFLOW_LISTEN_PORT} (UDP) "
         f"→ {FORWARD_IP}:{NETFLOW_FORWARD_PORT} "
-        f"(v5→v9 conversion, v9/IPFIX normalise-in-place)",
+        f"(v5→v9 conversion, v9/IPFIX normalise-in-place){spoof_info}",
         flush=True,
     )
 
