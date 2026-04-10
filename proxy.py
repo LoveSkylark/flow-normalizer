@@ -358,7 +358,7 @@ def _nf_device_rate(src_ip: str, embedded_rate: int = 0) -> int:
     return embedded_rate if embedded_rate > 0 else DEFAULT_SAMPLING_RATE
 
 
-def _maybe_log_nf_source(data: bytes, src_ip: str) -> None:
+def _maybe_log_nf_source(data: bytes, src_ip: str, transport: str = "UDP") -> None:
     """Log a NetFlow/IPFIX source on first appearance and after SOURCE_LOG_INTERVAL silence.
 
     Uses the same _source_last_seen table as sFlow so a device is never
@@ -423,10 +423,10 @@ def _maybe_log_nf_source(data: bytes, src_ip: str) -> None:
     else:
         return  # unknown version — parse_netflow will raise, skip logging
 
-    print(f"{ts} {label} src={src_ip} version={version}{extra}", flush=True)
+    print(f"{ts} {label} src={src_ip} transport={transport} version={version}{extra}", flush=True)
 
 
-def _maybe_log_nf_forward(packet: bytes, src_ip: str) -> None:
+def _maybe_log_nf_forward(packet: bytes, src_ip: str, transport: str = "UDP") -> None:
     """Log a forwarded NetFlow/IPFIX packet, rate-limited per source by SOURCE_LOG_INTERVAL."""
     if len(packet) < 2:
         return
@@ -443,14 +443,14 @@ def _maybe_log_nf_forward(packet: bytes, src_ip: str) -> None:
     if version == 9 and len(packet) >= 20:
         _, count, _, _, pkg_seq, source_id = struct.unpack_from("!HHIIII", packet, 0)
         print(
-            f"{ts} NF_FORWARDED src={src_ip} dst={FORWARD_IP}:{NETFLOW_FORWARD_PORT}"
+            f"{ts} NF_FORWARDED src={src_ip} transport={transport} dst={FORWARD_IP}:{NETFLOW_FORWARD_PORT}"
             f" version=9 records={count} seq={pkg_seq} source_id={source_id} len={len(packet)}",
             flush=True,
         )
     elif version == 10 and len(packet) >= 16:
         _, msg_len, _, seq_num, obs_domain_id = struct.unpack_from("!HHIII", packet, 0)
         print(
-            f"{ts} NF_FORWARDED src={src_ip} dst={FORWARD_IP}:{NETFLOW_FORWARD_PORT}"
+            f"{ts} NF_FORWARDED src={src_ip} transport={transport} dst={FORWARD_IP}:{NETFLOW_FORWARD_PORT}"
             f" version=10 msg_len={msg_len} seq={seq_num} obs_domain_id={obs_domain_id} len={len(packet)}",
             flush=True,
         )
@@ -798,6 +798,43 @@ class NetFlowProtocol(asyncio.DatagramProtocol):
         print(f"NetFlow socket error: {exc}", file=sys.stderr, flush=True)
 
 
+async def _read_sflow_tcp_frame(reader: asyncio.StreamReader) -> bytes:
+    """Read one length-prefixed sFlow TCP frame."""
+    length_bytes = await reader.readexactly(4)
+    length = _TCP_FRAME.unpack(length_bytes)[0]
+    return await reader.readexactly(length)
+
+
+async def _read_nf_tcp_frame(reader: asyncio.StreamReader) -> bytes:
+    """Read one NetFlow v9 or IPFIX message from a TCP stream.
+
+    IPFIX (v10): total message length is embedded in the header at bytes 2-3.
+    NetFlow v9:  no total-length field — FlowSets are walked to find the boundary.
+    """
+    hdr = await reader.readexactly(4)
+    version, second = struct.unpack_from("!HH", hdr, 0)
+
+    if version == 10:  # IPFIX — second word is total message length (includes header)
+        remaining = second - 4
+        if remaining < 0:
+            raise ValueError(f"IPFIX message length too short: {second}")
+        return hdr + await reader.readexactly(remaining)
+
+    if version == 9:  # NetFlow v9 — second word is FlowSet count, no total length
+        count = second
+        hdr_rest = await reader.readexactly(16)  # uptime(4) unix_secs(4) pkg_seq(4) source_id(4)
+        body = bytearray()
+        for _ in range(count):
+            fs_hdr = await reader.readexactly(4)
+            fs_len = struct.unpack_from("!H", fs_hdr, 2)[0]
+            if fs_len < 4:
+                raise ValueError(f"NetFlow v9 FlowSet length too short: {fs_len}")
+            body += fs_hdr + await reader.readexactly(fs_len - 4)
+        return hdr + hdr_rest + bytes(body)
+
+    raise ValueError(f"Unsupported NetFlow version over TCP: {version}")
+
+
 async def handle_tcp_connection(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
@@ -813,21 +850,16 @@ async def handle_tcp_connection(
     try:
         while True:
             try:
-                length_bytes = await reader.readexactly(4)
+                data = await _read_sflow_tcp_frame(reader)
             except asyncio.IncompleteReadError:
                 break  # clean disconnect
-            length = _TCP_FRAME.unpack(length_bytes)[0]
-            try:
-                data = await reader.readexactly(length)
-            except asyncio.IncompleteReadError:
-                break
 
             _maybe_log_source(data, "TCP")
             try:
                 packet = parse_datagram(data)
             except Exception as exc:
                 print(
-                    f"DROP TCP {peer[0]} len={length}: {exc}",
+                    f"DROP TCP {peer[0]} len={len(data)}: {exc}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -845,6 +877,52 @@ async def handle_tcp_connection(
             await fwd_writer.wait_closed()
         except Exception:
             pass
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def handle_nf_tcp_connection(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    fwd_sock: socket.socket,
+) -> None:
+    """Accept a NetFlow/IPFIX TCP session, process frames, and forward via UDP.
+
+    Uses _read_nf_tcp_frame for self-delimiting IPFIX (v10) and FlowSet-walked
+    NetFlow v9 framing.  Forwarding reuses the same UDP path as the UDP handler,
+    including SPOOF_UDP_SOURCE if enabled.
+    """
+    peer = writer.get_extra_info("peername", ("unknown", 0))
+    peer_ip = peer[0]
+
+    try:
+        while True:
+            try:
+                data = await _read_nf_tcp_frame(reader)
+            except asyncio.IncompleteReadError:
+                break  # clean disconnect
+            _maybe_log_nf_source(data, peer_ip, "TCP")
+            try:
+                packet = parse_netflow(data, peer_ip)
+            except Exception as exc:
+                print(
+                    f"NF DROP TCP {peer_ip} len={len(data)}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            if packet is not None:
+                if SPOOF_UDP_SOURCE:
+                    _get_udp_spoof_sock(peer_ip).sendto(packet, (FORWARD_IP, NETFLOW_FORWARD_PORT))
+                else:
+                    fwd_sock.sendto(packet, (FORWARD_IP, NETFLOW_FORWARD_PORT))
+                _maybe_log_nf_forward(packet, peer_ip, "TCP")
+    except Exception as exc:
+        print(f"NF TCP {peer_ip}: {exc}", file=sys.stderr, flush=True)
+    finally:
         writer.close()
         try:
             await writer.wait_closed()
@@ -886,6 +964,12 @@ async def main() -> None:
         local_addr=("0.0.0.0", NETFLOW_LISTEN_PORT),
     )
 
+    nf_tcp_server = await asyncio.start_server(
+        lambda r, w: handle_nf_tcp_connection(r, w, nf_forward_sock),
+        "0.0.0.0",
+        NETFLOW_LISTEN_PORT,
+    )
+
     override_info = f" device_overrides={len(DEVICE_RATES)}" if DEVICE_RATES else ""
     spoof_info = " udp_src_spoof=on" if SPOOF_UDP_SOURCE else ""
     print(
@@ -896,15 +980,18 @@ async def main() -> None:
         flush=True,
     )
     print(
-        f"netflow-normalizer listening on :{NETFLOW_LISTEN_PORT} (UDP) "
+        f"netflow-normalizer listening on :{NETFLOW_LISTEN_PORT} (UDP+TCP) "
         f"→ {FORWARD_IP}:{NETFLOW_FORWARD_PORT} "
         f"(v5→v9 conversion, v9/IPFIX normalise-in-place){spoof_info}",
         flush=True,
     )
 
     try:
-        async with tcp_server:
-            await tcp_server.serve_forever()
+        async with tcp_server, nf_tcp_server:
+            await asyncio.gather(
+                tcp_server.serve_forever(),
+                nf_tcp_server.serve_forever(),
+            )
     finally:
         udp_transport.close()
         forward_sock.close()
