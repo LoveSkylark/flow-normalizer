@@ -1064,14 +1064,14 @@ async def main() -> None:
     override_info = f" device_overrides={len(DEVICE_RATES)}" if DEVICE_RATES else ""
     spoof_info = " udp_src_spoof=on" if SPOOF_UDP_SOURCE else ""
     print(
-        f"flow-normalizer sflow listening on :{SFLOW_PORT} (UDP+TCP) "
+        f"sflow is listening on :{SFLOW_PORT} (UDP+TCP) "
         f"→ {FORWARD_IP}:{SFLOW_FORWARD_PORT} "
         f"forward_rate={FORWARD_RATE} default_rate={DEFAULT_SAMPLING_RATE}"
         f"{override_info}{spoof_info}",
         flush=True,
     )
     print(
-        f"netflow-normalizer listening on :{NETFLOW_LISTEN_PORT} (UDP+TCP) "
+        f"netflow is listening on :{NETFLOW_LISTEN_PORT} (UDP+TCP) "
         f"→ {FORWARD_IP}:{NETFLOW_FORWARD_PORT} "
         f"(v5→v9 conversion, v9/IPFIX normalise-in-place){spoof_info}",
         flush=True,
