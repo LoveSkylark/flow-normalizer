@@ -1057,44 +1057,55 @@ async def handle_tcp_connection(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
     peer = writer.get_extra_info("peername", ("unknown", 0))
+
+    # Read frames and forward via UDP instead of TCP if collector
+    # does not accept TCP sFlow.
+    fwd_writer = None
+    fwd_reader = None
     try:
         fwd_reader, fwd_writer = await asyncio.open_connection(FORWARD_IP, SFLOW_FORWARD_PORT)
     except Exception as exc:
-        print(f"TCP fwd connect failed from {peer[0]}: {exc}", file=sys.stderr, flush=True)
-        writer.close()
-        await writer.wait_closed()
-        return
+        # Collector not accepting TCP — fall back to UDP forwarding.
+        print(
+            f"TCP fwd connect failed from {peer[0]}: {exc} — falling back to UDP",
+            file=sys.stderr, flush=True,
+        )
+
+    # Use a plain UDP socket as fallback.
+    udp_fallback = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if fwd_writer is None else None
 
     try:
         while True:
             try:
                 data = await _read_sflow_tcp_frame(reader)
             except asyncio.IncompleteReadError:
-                break  # clean disconnect
+                break
 
             _maybe_log_sflow_source(data, "TCP")
             try:
                 packet = _parse_sflow_datagram(data)
             except Exception as exc:
-                print(
-                    f"DROP TCP {peer[0]} len={len(data)}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print(f"DROP TCP {peer[0]} len={len(data)}: {exc}", file=sys.stderr, flush=True)
                 continue
 
             if packet is not None:
-                fwd_writer.write(_TCP_FRAME.pack(len(packet)) + packet)
-                await fwd_writer.drain()
+                if fwd_writer is not None:
+                    fwd_writer.write(_TCP_FRAME.pack(len(packet)) + packet)
+                    await fwd_writer.drain()
+                else:
+                    udp_fallback.sendto(packet, (FORWARD_IP, SFLOW_FORWARD_PORT))
                 _maybe_log_sflow_forward(packet, "TCP")
     except Exception as exc:
         print(f"TCP {peer[0]}: {exc}", file=sys.stderr, flush=True)
     finally:
-        fwd_writer.close()
-        try:
-            await fwd_writer.wait_closed()
-        except Exception:
-            pass
+        if fwd_writer is not None:
+            fwd_writer.close()
+            try:
+                await fwd_writer.wait_closed()
+            except Exception:
+                pass
+        if udp_fallback is not None:
+            udp_fallback.close()
         writer.close()
         try:
             await writer.wait_closed()
