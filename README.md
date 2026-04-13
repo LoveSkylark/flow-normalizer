@@ -39,7 +39,6 @@ data so traffic volume stays correct.
 | `device_rate > FORWARD_RATE`  | Scale counts up             |
 | `device_rate == FORWARD_RATE` | No change                   |
 | `device_rate < FORWARD_RATE`  | Drop samples randomly       |
-| `device_rate == 0`            | Use `DEFAULT_SAMPLING_RATE` |
 
 Counter samples are passed through unchanged.
 
