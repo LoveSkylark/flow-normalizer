@@ -229,7 +229,7 @@ FORWARD_IP=127.0.0.1 FORWARD_RATE=100 DEFAULT_SAMPLING_RATE=512 \
   python3 proxy.py
 
 # Terminal 2
-python3 test_sender.py 6343 16343 "" 2055 16055
+python3 tests/test_sender.py 6343 16343 "" 2055 16055
 ```
 
 Expected: `38/38 passed`
