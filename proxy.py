@@ -5,6 +5,7 @@ import socket
 import struct
 import sys
 import time
+import math
 
 SFLOW_PORT = int(os.environ.get("SFLOW_PORT", 6343))
 FORWARD_RATE = int(os.environ.get("FORWARD_RATE", 100))  # sampling rate stamped on all forwarded flows
@@ -70,6 +71,10 @@ _udp_spoof_socks: dict[str, socket.socket] = {}
 
 # Maximum number of entries in any per-source cache dict before the oldest is evicted.
 _CACHE_MAXSIZE = 1000
+
+# Safety limits for NetFlow/IPFIX over TCP framing.
+_NF_MAX_MSG = 65535
+_NF_MAX_FLOWSETS = 4096
 
 
 def _maybe_evict(d: dict) -> None:
@@ -166,24 +171,68 @@ _V9_TMPL_FLOWSET = _build_v9_template_flowset()
 # Template cache: src_ip → domain_id → template_id → [(field_type, field_length)]
 _tmpl_cache: dict[str, dict[int, dict[int, list[tuple[int, int]]]]] = {}
 
-# Frozenset for O(1) membership test in hot-path field scanning.
-_NF_SCALE_TYPES = frozenset({_NF_IN_PKTS, _NF_IN_BYTES, _NF_OUT_PKTS, _NF_OUT_BYTES})
-
-# Struct and max-value lookup for fast counter scaling of common field widths.
-_SCALE_STRUCT: dict[int, struct.Struct] = {
-    2: struct.Struct("!H"),
-    4: struct.Struct("!I"),
-    8: struct.Struct("!Q"),
-}
 _SCALE_MAX: dict[int, int] = {2: 0xFFFF, 4: 0xFFFF_FFFF, 8: 0xFFFF_FFFF_FFFF_FFFF}
 
-# Maximum NetFlow/IPFIX message size accepted over TCP (sanity cap).
-_NF_MAX_MSG = 65535
 
-# Maximum number of FlowSets allowed per NetFlow v9 TCP message.
-# A malicious sender could advertise count=65535 and force 65535 read iterations;
-# cap at a safe upper bound (typical packets carry fewer than 100 FlowSets).
-_NF_MAX_FLOWSETS = 1000
+def _read_uint_be(buf: bytes | bytearray, offset: int, size: int) -> int:
+    return int.from_bytes(buf[offset:offset + size], "big")
+
+
+def _write_uint_be(buf: bytearray, offset: int, size: int, value: int) -> None:
+    max_value = (1 << (size * 8)) - 1
+    buf[offset:offset + size] = max(0, min(int(value), max_value)).to_bytes(size, "big")
+
+
+def _binomial_sample(n: int, p: float) -> int:
+    if n <= 0 or p <= 0.0:
+        return 0
+    if p >= 1.0:
+        return n
+
+    fn = getattr(random, "binomialvariate", None)
+    if fn is not None:
+        return fn(n, p)
+
+    # Use faster approximate for large n, small p (Poisson-like fallback)
+    if n > 100 and p < 0.1:
+        lmbda = n * p
+        L = math.exp(-lmbda)
+        k = 0
+        prod = 1.0
+        while prod > L:
+            k += 1
+            prod *= random.random()
+        return k - 1
+
+    if p > 0.5:
+        return n - _binomial_sample(n, 1.0 - p)
+
+    return sum(1 for _ in range(n) if random.random() < p)
+
+
+def _thin_packet_counter(packet_count: int, p: float) -> int:
+    """Accept pre-computed probability instead of device_rate."""
+    if packet_count <= 0 or p <= 0.0:
+        return 0
+    if p >= 1.0:
+        return packet_count
+    return _binomial_sample(packet_count, p)
+
+
+def _thin_octet_counter(octet_count: int, original_packets: int, kept_packets: int) -> int:
+    if octet_count <= 0 or original_packets <= 0 or kept_packets <= 0:
+        return 0
+    if kept_packets >= original_packets:
+        return octet_count
+    avg_size = octet_count / original_packets
+    return min(int(round(kept_packets * avg_size)), int(octet_count))
+
+
+def _int_upscale_ratio(device_rate: int) -> int:
+    """Integer upscale ratio: e.g. device_rate=512, FORWARD_RATE=100 → 5."""
+    if FORWARD_RATE <= 0:
+        return 1
+    return max(1, device_rate // FORWARD_RATE)
 
 
 # ─── sFlow processing ─────────────────────────────────────────────────────────
@@ -459,23 +508,27 @@ def _maybe_log_nf_source(data: bytes, src_ip: str, transport: str = "UDP") -> No
         else:
             rate_src = f"no_rate→default={DEFAULT_SAMPLING_RATE}"
 
-        if device_rate > FORWARD_RATE:
-            action = f"downscale×{device_rate // FORWARD_RATE}"
-        elif device_rate < FORWARD_RATE:
-            action = f"upscale_prob={round(device_rate / FORWARD_RATE * 100)}%_forwarded"
-        else:
+        if device_rate < FORWARD_RATE:
+            action = f"binomial_thin_p={device_rate / FORWARD_RATE:.6f}"
+        elif device_rate == FORWARD_RATE:
             action = "exact_match"
-
-        extra = (f" flow_records={count} seq={flow_seq}"
-                 f" sampling_interval={sampling_int} rate_src={rate_src} action={action} →v9")
+        else:
+            action = f"upscale_ratio={device_rate / FORWARD_RATE:.6f}"
+        extra = (
+            f" flow_records={count} seq={flow_seq}"
+            f" sampling_interval={sampling_int} rate_src={rate_src} action={action} →v9"
+        )
 
     elif version == 9:
         if len(data) < 20:
             return
         _, count, _, _, pkg_seq, source_id = struct.unpack_from("!HHIIII", data, 0)
         device_rate = _nf_device_rate(src_ip)
-        rate_src = (f"override={device_rate}" if src_ip in DEVICE_RATES
-                    else f"default={DEFAULT_SAMPLING_RATE}")
+        rate_src = (
+            f"override={device_rate}"
+            if src_ip in DEVICE_RATES
+            else f"default={DEFAULT_SAMPLING_RATE}"
+        )
         extra = f" records={count} seq={pkg_seq} source_id={source_id} rate_src={rate_src}"
 
     elif version == 10:  # IPFIX
@@ -483,10 +536,15 @@ def _maybe_log_nf_source(data: bytes, src_ip: str, transport: str = "UDP") -> No
             return
         _, msg_len, _, seq_num, obs_domain_id = struct.unpack_from("!HHIII", data, 0)
         device_rate = _nf_device_rate(src_ip)
-        rate_src = (f"override={device_rate}" if src_ip in DEVICE_RATES
-                    else f"default={DEFAULT_SAMPLING_RATE}")
-        extra = (f" msg_len={msg_len} seq={seq_num}"
-                 f" obs_domain_id={obs_domain_id} rate_src={rate_src}")
+        rate_src = (
+            f"override={device_rate}"
+            if src_ip in DEVICE_RATES
+            else f"default={DEFAULT_SAMPLING_RATE}"
+        )
+        extra = (
+            f" msg_len={msg_len} seq={seq_num}"
+            f" obs_domain_id={obs_domain_id} rate_src={rate_src}"
+        )
 
     else:
         return  # unknown version — parse_netflow will raise, skip logging
@@ -586,79 +644,114 @@ def _normalize_data_flowset(
     domain_id: int,
     device_rate: int,
 ) -> bytes | None:
-    """Normalise IN_PKTS / IN_BYTES fields in a v9 or IPFIX data FlowSet.
+    """Normalise packet and byte counters in a v9 or IPFIX data FlowSet.
 
-    Returns the modified FlowSet bytes, the original FlowSet if the template is
-    not yet cached (unknown template), or None if every record was dropped.
+    device_rate > FORWARD_RATE: upscale counters (unbiased stochastic rounding)
+    device_rate < FORWARD_RATE: binomial thinning
+    device_rate == FORWARD_RATE: pass through unchanged
     """
     fields = _tmpl_cache.get(src_ip, {}).get(domain_id, {}).get(tmpl_id)
     if fields is None:
-        return flowset  # unknown template — forward as-is
+        return flowset
+
+    if FORWARD_RATE <= 0 or device_rate == FORWARD_RATE:
+        return flowset
+
+    upscale_ratio = _int_upscale_ratio(device_rate) if device_rate > FORWARD_RATE else 1
+    p_keep = (device_rate / FORWARD_RATE) if device_rate < FORWARD_RATE else 1.0
 
     record_size = sum(flen for _, flen in fields)
     if record_size == 0:
         return flowset
 
-    # Pre-compute (offset_within_record, field_len) for fields we need to scale.
-    scale_fields: list[tuple[int, int]] = []
+    # Build offset index for all fields once.
+    pkt_meta: dict[int, tuple[int, int]] = {}   # ftype → (offset, len)
+    byte_meta: list[tuple[int, int, int]] = []   # (ftype, offset, len)
     rec_off = 0
     for ftype, flen in fields:
-        if ftype in _NF_SCALE_TYPES:
-            scale_fields.append((rec_off, flen))
+        if ftype in (_NF_IN_PKTS, _NF_OUT_PKTS):
+            pkt_meta[ftype] = (rec_off, flen)
+        elif ftype in (_NF_IN_BYTES, _NF_OUT_BYTES):
+            byte_meta.append((ftype, rec_off, flen))
         rec_off += flen
 
-    # Hoist all loop invariants out of the inner loop.
-    do_drop     = device_rate < FORWARD_RATE
-    drop_thresh = device_rate / FORWARD_RATE if do_drop else 0.0
-    do_scale    = device_rate > FORWARD_RATE and bool(scale_fields)
-    ratio       = device_rate // FORWARD_RATE if do_scale else 0
-
-    out_parts: list[bytes | bytearray] = []
+    out_parts: list[bytes] = []
     out_len = 0
-    offset  = 4   # skip 4-byte FlowSet header
-    end     = len(flowset)
+    offset = 4
+    end = len(flowset)
 
     while offset + record_size <= end:
-        if do_drop and random.random() >= drop_thresh:
-            offset += record_size
-            continue  # probabilistically dropped
+        record = bytearray(flowset[offset : offset + record_size])
 
-        if do_scale:
-            record = bytearray(flowset[offset : offset + record_size])
-            for foff, flen in scale_fields:
-                sc = _SCALE_STRUCT.get(flen)
-                if sc:
-                    val = min(sc.unpack_from(record, foff)[0] * ratio, _SCALE_MAX[flen])
-                    sc.pack_into(record, foff, val)
-                else:
-                    val = int.from_bytes(record[foff : foff + flen], "big")
-                    val = min(val * ratio, (1 << (flen * 8)) - 1)
-                    record[foff : foff + flen] = val.to_bytes(flen, "big")
+        if device_rate > FORWARD_RATE:
+            # Upscale: multiply all counters by integer ratio.
+            for pkt_type in (_NF_IN_PKTS, _NF_OUT_PKTS):
+                meta = pkt_meta.get(pkt_type)
+                if not meta:
+                    continue
+                pkt_off, pkt_len = meta
+                pkt_val = _read_uint_be(record, pkt_off, pkt_len)
+                max_val = _SCALE_MAX.get(pkt_len, (1 << (pkt_len * 8)) - 1)
+                _write_uint_be(record, pkt_off, pkt_len, min(pkt_val * upscale_ratio, max_val))
+
+            for _btype, byte_off, byte_len in byte_meta:
+                byte_val = _read_uint_be(record, byte_off, byte_len)
+                max_val = _SCALE_MAX.get(byte_len, (1 << (byte_len * 8)) - 1)
+                _write_uint_be(record, byte_off, byte_len, min(byte_val * upscale_ratio, max_val))
+
             out_parts.append(bytes(record))
-        else:
-            out_parts.append(flowset[offset : offset + record_size])
+            out_len += record_size
 
-        out_len += record_size
-        offset  += record_size
+        else:
+            # Downscale: binomial thinning per record.
+            had_pkt_field = False
+            any_kept = False
+            orig_pkts: dict[int, int] = {}
+            kept_pkts: dict[int, int] = {}
+
+            for pkt_type in (_NF_IN_PKTS, _NF_OUT_PKTS):
+                meta = pkt_meta.get(pkt_type)
+                if not meta:
+                    continue
+                had_pkt_field = True
+                pkt_off, pkt_len = meta
+                pkt_val = _read_uint_be(record, pkt_off, pkt_len)
+                kept = _thin_packet_counter(pkt_val, p_keep)
+                orig_pkts[pkt_type] = pkt_val
+                kept_pkts[pkt_type] = kept
+                _write_uint_be(record, pkt_off, pkt_len, kept)
+                if kept > 0:
+                    any_kept = True
+
+            if had_pkt_field and not any_kept:
+                offset += record_size
+                continue
+
+            for btype, byte_off, byte_len in byte_meta:
+                byte_val = _read_uint_be(record, byte_off, byte_len)
+                pkt_type = _NF_IN_PKTS if btype == _NF_IN_BYTES else _NF_OUT_PKTS
+                orig = orig_pkts.get(pkt_type, 0)
+                kept = kept_pkts.get(pkt_type, 0)
+                new_bytes = _thin_octet_counter(byte_val, orig, kept) if orig > 0 else int(round(byte_val * p_keep))
+                _write_uint_be(record, byte_off, byte_len, new_bytes)
+
+            out_parts.append(bytes(record))
+            out_len += record_size
+
+        offset += record_size
 
     if not out_parts:
         return None
 
-    pad   = (-out_len) & 3
+    pad = (-out_len) & 3
     total = 4 + out_len + pad
-    hdr   = bytearray(flowset[:4])
+    hdr = bytearray(flowset[:4])
     struct.pack_into("!H", hdr, 2, total)
     return bytes(hdr) + b"".join(out_parts) + bytes(pad)
 
 
 def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
-    """Parse a NetFlow v5 datagram, normalise flows, and return a NetFlow v9 datagram.
-
-    The v9 output includes a Template FlowSet (template ID 256) followed by a
-    Data FlowSet.  Sampling rate resolution (highest priority first):
-      1. DEVICE_RATES override keyed by src_ip
-      2. Embedded sampling_interval from the v5 header (lower 14 bits, if > 0)
-      3. DEFAULT_SAMPLING_RATE fallback
+    """Parse a NetFlow v5 datagram and return normalize
     """
     if len(data) < _NF5_HDR.size:
         raise ValueError(f"NF v5 too short: {len(data)}")
@@ -675,9 +768,8 @@ def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
 
     device_rate = _nf_device_rate(src_ip, sampling_int & 0x3FFF)
 
-    do_drop     = device_rate < FORWARD_RATE
-    drop_thresh = device_rate / FORWARD_RATE if do_drop else 0.0
-    scale_ratio = device_rate // FORWARD_RATE if device_rate > FORWARD_RATE else 0
+    upscale_ratio = _int_upscale_ratio(device_rate) if device_rate > FORWARD_RATE else 1
+    p_keep = (device_rate / FORWARD_RATE) if device_rate < FORWARD_RATE else 1.0
 
     out_records: list[bytes] = []
     for i in range(count):
@@ -686,16 +778,23 @@ def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
             src_as, dst_as, src_mask, dst_mask = \
             _NF5_REC.unpack_from(data, _NF5_HDR.size + i * _NF5_REC.size)
 
-        if do_drop and random.random() >= drop_thresh:
-            continue  # probabilistically dropped
-
-        if scale_ratio:
-            dpkts   = min(dpkts   * scale_ratio, 0xFFFF_FFFF)
-            doctets = min(doctets * scale_ratio, 0xFFFF_FFFF)
+        if device_rate > FORWARD_RATE and FORWARD_RATE > 0:
+            # Upscale: keep all records, integer ratio scaling.
+            kept_pkts   = min(dpkts   * upscale_ratio, 0xFFFF_FFFF)
+            kept_octets = min(doctets * upscale_ratio, 0xFFFF_FFFF)
+        elif device_rate < FORWARD_RATE and FORWARD_RATE > 0:
+            # Downscale: binomial thinning.
+            kept_pkts = _thin_packet_counter(dpkts, p_keep)
+            if kept_pkts <= 0:
+                continue
+            kept_octets = _thin_octet_counter(doctets, dpkts, kept_pkts)
+        else:
+            kept_pkts   = dpkts
+            kept_octets = doctets
 
         out_records.append(_V5_DATA_REC.pack(
             srcaddr, dstaddr, nexthop, inp, outp,
-            dpkts, doctets, first, last,
+            kept_pkts, kept_octets, first, last,
             srcport, dstport, tcp_flags, prot, tos,
             src_as, dst_as, src_mask, dst_mask,
         ))
@@ -703,8 +802,6 @@ def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
     if not out_records:
         return None
 
-    # v9 header: version(2) count(2) uptime(4) unix_secs(4) pkg_seq(4) source_id(4)
-    # count = 1 template record + N data records
     v9_hdr = struct.pack("!HHIIII", 9, 1 + len(out_records), uptime, unix_secs, flow_seq, 0)
 
     raw = b"".join(out_records)
@@ -733,6 +830,7 @@ def normalize_nf9(data: bytes, src_ip: str) -> bytes | None:
         raise ValueError(f"Not NF v9: version={version}")
 
     device_rate = _nf_device_rate(src_ip)
+
     out_flowsets: list[bytes] = []
     offset = 20
 
@@ -780,6 +878,7 @@ def normalize_ipfix(data: bytes, src_ip: str) -> bytes | None:
         raise ValueError(f"Not IPFIX: version={version}")
 
     device_rate = _nf_device_rate(src_ip)
+
     out_sets: list[bytes] = []
     offset = 16
 
@@ -894,80 +993,110 @@ async def _read_sflow_tcp_frame(reader: asyncio.StreamReader) -> bytes:
 
 
 async def _read_nf_tcp_frame(reader: asyncio.StreamReader) -> bytes:
-    """Read one NetFlow v9 or IPFIX message from a TCP stream.
+    """Read one NetFlow v9 or IPFIX message from TCP.
 
-    IPFIX (v10): total message length is embedded in the header at bytes 2-3.
-    NetFlow v9:  no total-length field — FlowSets are walked to find the boundary.
+    IPFIX has explicit message length.
+    NetFlow v9 has no message length on TCP, so read one FlowSet minimum then
+    keep reading additional FlowSets until a short idle gap.
     """
     hdr = await reader.readexactly(4)
     version, second = struct.unpack_from("!HH", hdr, 0)
 
-    if version == 10:  # IPFIX — second word is total message length (includes header)
+    if version == 10:  # IPFIX
         remaining = second - 4
         if not (0 <= remaining <= _NF_MAX_MSG):
             raise ValueError(f"IPFIX message length out of range: {second}")
         return hdr + await reader.readexactly(remaining)
 
-    if version == 9:  # NetFlow v9 — second word is FlowSet count, no total length
-        count    = second
-        if count > _NF_MAX_FLOWSETS:
-            raise ValueError(f"NetFlow v9 FlowSet count exceeds limit ({count} > {_NF_MAX_FLOWSETS})")
-        hdr_rest = await reader.readexactly(16)  # uptime(4) unix_secs(4) pkg_seq(4) source_id(4)
-        parts: list[bytes] = [hdr, hdr_rest]
-        for _ in range(count):
-            fs_hdr = await reader.readexactly(4)
-            fs_len = struct.unpack_from("!H", fs_hdr, 2)[0]
-            if not (4 <= fs_len <= _NF_MAX_MSG):
-                raise ValueError(f"NetFlow v9 FlowSet length invalid: {fs_len}")
-            parts.append(fs_hdr)
-            parts.append(await reader.readexactly(fs_len - 4))
-        return b"".join(parts)
+    if version != 9:
+        raise ValueError(f"Unsupported NetFlow version over TCP: {version}")
 
-    raise ValueError(f"Unsupported NetFlow version over TCP: {version}")
+    hdr_rest = await reader.readexactly(16)
+    parts: list[bytes] = [hdr, hdr_rest]
+    total = 20
+
+    # Require at least one FlowSet.
+    fs_hdr = await reader.readexactly(4)
+    fs_len = struct.unpack_from("!H", fs_hdr, 2)[0]
+    if not (4 <= fs_len <= _NF_MAX_MSG):
+        raise ValueError(f"NetFlow v9 FlowSet length invalid: {fs_len}")
+    fs_body = await reader.readexactly(fs_len - 4)
+    parts.extend([fs_hdr, fs_body])
+    total += fs_len
+
+    # Best-effort: collect more FlowSets until stream goes idle briefly.
+    while total < _NF_MAX_MSG:
+        try:
+            fs_hdr = await asyncio.wait_for(reader.readexactly(4), timeout=0.02)
+        except asyncio.TimeoutError:
+            break
+        except asyncio.IncompleteReadError:
+            break
+
+        fs_len = struct.unpack_from("!H", fs_hdr, 2)[0]
+        if not (4 <= fs_len <= _NF_MAX_MSG):
+            raise ValueError(f"NetFlow v9 FlowSet length invalid: {fs_len}")
+
+        fs_body = await reader.readexactly(fs_len - 4)
+        parts.extend([fs_hdr, fs_body])
+        total += fs_len
+
+    return b"".join(parts)
 
 
 async def handle_tcp_connection(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
     peer = writer.get_extra_info("peername", ("unknown", 0))
+
+    # Read frames and forward via UDP instead of TCP if collector
+    # does not accept TCP sFlow.
+    fwd_writer = None
+    fwd_reader = None
     try:
         fwd_reader, fwd_writer = await asyncio.open_connection(FORWARD_IP, SFLOW_FORWARD_PORT)
     except Exception as exc:
-        print(f"TCP fwd connect failed from {peer[0]}: {exc}", file=sys.stderr, flush=True)
-        writer.close()
-        await writer.wait_closed()
-        return
+        # Collector not accepting TCP — fall back to UDP forwarding.
+        print(
+            f"TCP fwd connect failed from {peer[0]}: {exc} — falling back to UDP",
+            file=sys.stderr, flush=True,
+        )
+
+    # Use a plain UDP socket as fallback.
+    udp_fallback = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if fwd_writer is None else None
 
     try:
         while True:
             try:
                 data = await _read_sflow_tcp_frame(reader)
             except asyncio.IncompleteReadError:
-                break  # clean disconnect
+                break
 
             _maybe_log_sflow_source(data, "TCP")
             try:
                 packet = _parse_sflow_datagram(data)
             except Exception as exc:
-                print(
-                    f"DROP TCP {peer[0]} len={len(data)}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print(f"DROP TCP {peer[0]} len={len(data)}: {exc}", file=sys.stderr, flush=True)
                 continue
 
             if packet is not None:
-                fwd_writer.write(_TCP_FRAME.pack(len(packet)) + packet)
-                await fwd_writer.drain()
+                if fwd_writer is not None:
+                    fwd_writer.write(_TCP_FRAME.pack(len(packet)) + packet)
+                    await fwd_writer.drain()
+                else:
+                    udp_fallback.sendto(packet, (FORWARD_IP, SFLOW_FORWARD_PORT))
                 _maybe_log_sflow_forward(packet, "TCP")
     except Exception as exc:
         print(f"TCP {peer[0]}: {exc}", file=sys.stderr, flush=True)
     finally:
-        fwd_writer.close()
-        try:
-            await fwd_writer.wait_closed()
-        except Exception:
-            pass
+        if fwd_writer is not None:
+            fwd_writer.close()
+            try:
+                await fwd_writer.wait_closed()
+            except Exception:
+                pass
+        if udp_fallback is not None:
+            udp_fallback.close()
         writer.close()
         try:
             await writer.wait_closed()
@@ -1022,6 +1151,10 @@ async def handle_nf_tcp_connection(
 
 
 async def main() -> None:
+    print(
+        f"RUNNING {__file__} | _NF_MAX_MSG={_NF_MAX_MSG} _NF_MAX_FLOWSETS={_NF_MAX_FLOWSETS}",
+        flush=True,
+    )
     if SPOOF_UDP_SOURCE:
         try:
             _test = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

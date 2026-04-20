@@ -9,10 +9,10 @@ Usage (proxy must already be running):
       SFLOW_FORWARD_PORT=16343 NETFLOW_FORWARD_PORT=16055 \\
       python proxy.py
 
-    python test_sender.py [sflow_proxy_port [sflow_col_port [override [nf_proxy_port [nf_col_port]]]]]
+    python tests/test_sender.py [sflow_proxy_port [sflow_col_port [override [nf_proxy_port [nf_col_port]]]]]
 
 Defaults: sflow_proxy=6343  sflow_col=16343  nf_proxy=2055  nf_col=16055
-Example:  python test_sender.py 6343 16343 "" 2055 16055
+Example:  python tests/test_sender.py 6343 16343 "" 2055 16055
 """
 
 import socket
@@ -26,7 +26,7 @@ PROXY_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6343
 COLLECTOR_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 16343
 # Optional: pass "ip:rate" as 3rd arg to test per-device override.
 # The proxy must have been started with DEVICE_RATES=<ip>:<rate> matching.
-# Example: python3 test_sender.py 6343 16343 127.0.0.1:200
+# Example: python3 tests/test_sender.py 6343 16343 127.0.0.1:200
 OVERRIDE_ARG = sys.argv[3] if (len(sys.argv) > 3 and sys.argv[3]) else None
 NF_PROXY_PORT    = int(sys.argv[4]) if len(sys.argv) > 4 else 2055
 NF_COLLECTOR_PORT = int(sys.argv[5]) if len(sys.argv) > 5 else 16055
