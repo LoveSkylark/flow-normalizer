@@ -171,15 +171,6 @@ _V9_TMPL_FLOWSET = _build_v9_template_flowset()
 # Template cache: src_ip → domain_id → template_id → [(field_type, field_length)]
 _tmpl_cache: dict[str, dict[int, dict[int, list[tuple[int, int]]]]] = {}
 
-# Frozenset for O(1) membership test in hot-path field scanning.
-_NF_SCALE_TYPES = frozenset({_NF_IN_PKTS, _NF_IN_BYTES, _NF_OUT_PKTS, _NF_OUT_BYTES})
-
-# Struct and max-value lookup for fast counter scaling of common field widths.
-_SCALE_STRUCT: dict[int, struct.Struct] = {
-    2: struct.Struct("!H"),
-    4: struct.Struct("!I"),
-    8: struct.Struct("!Q"),
-}
 _SCALE_MAX: dict[int, int] = {2: 0xFFFF, 4: 0xFFFF_FFFF, 8: 0xFFFF_FFFF_FFFF_FFFF}
 
 
