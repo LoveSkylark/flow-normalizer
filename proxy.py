@@ -10,6 +10,12 @@ import math
 SFLOW_PORT = int(os.environ.get("SFLOW_PORT", 6343))
 FORWARD_RATE = int(os.environ.get("FORWARD_RATE", 100))  # sampling rate stamped on all forwarded flows
 DEFAULT_SAMPLING_RATE = int(os.environ.get("DEFAULT_SAMPLING_RATE", 512))
+FIDELITY = os.environ.get("FIDELITY", "").lower() in ("1", "true", "yes")
+FIDELITY_TARGET = os.environ.get("FIDELITY_TARGET", "balanced").strip().lower() or "balanced"
+try:
+    FIDELITY_WINDOW_SECONDS = max(0.0, float(os.environ.get("FIDELITY_WINDOW_SECONDS", "1.0")))
+except ValueError:
+    FIDELITY_WINDOW_SECONDS = 1.0
 FORWARD_IP = os.environ["FORWARD_IP"]
 SFLOW_FORWARD_PORT = int(os.environ.get("SFLOW_FORWARD_PORT", 6343))
 
@@ -127,6 +133,11 @@ _NF_IN_PKTS   = 2
 _NF_IN_BYTES  = 1
 _NF_OUT_PKTS  = 24
 _NF_OUT_BYTES = 23
+_NF_PROTOCOL = 4
+_NF_L4_SRC_PORT = 7
+_NF_L4_DST_PORT = 11
+_NF_IPV4_SRC_ADDR = 8
+_NF_IPV4_DST_ADDR = 12
 
 # Template ID assigned to v5-converted flows in v9 output.
 _V5_TMPL_ID = 256
@@ -171,6 +182,10 @@ _V9_TMPL_FLOWSET = _build_v9_template_flowset()
 # Template cache: src_ip → domain_id → template_id → [(field_type, field_length)]
 _tmpl_cache: dict[str, dict[int, dict[int, list[tuple[int, int]]]]] = {}
 
+# Deterministic quota tracker used when FIDELITY=true. Keys represent a source
+# or counter stream; values hold the fractional remainder carried forward.
+_fidelity_remainder: dict[object, float] = {}
+
 _SCALE_MAX: dict[int, int] = {2: 0xFFFF, 4: 0xFFFF_FFFF, 8: 0xFFFF_FFFF_FFFF_FFFF}
 
 
@@ -210,12 +225,31 @@ def _binomial_sample(n: int, p: float) -> int:
     return sum(1 for _ in range(n) if random.random() < p)
 
 
-def _thin_packet_counter(packet_count: int, p: float) -> int:
+def _fidelity_reduce_count(key: object, original_count: int, p: float) -> int:
+    if original_count <= 0 or p <= 0.0:
+        return 0
+    if p >= 1.0:
+        return original_count
+
+    remainder = _fidelity_remainder.get(key, 0.0)
+    quota = remainder + (original_count * p)
+    kept = int(quota)
+    if kept > original_count:
+        kept = original_count
+    if key not in _fidelity_remainder:
+        _maybe_evict(_fidelity_remainder)
+    _fidelity_remainder[key] = quota - kept
+    return kept
+
+
+def _thin_packet_counter(packet_count: int, p: float, key: object | None = None) -> int:
     """Accept pre-computed probability instead of device_rate."""
     if packet_count <= 0 or p <= 0.0:
         return 0
     if p >= 1.0:
         return packet_count
+    if FIDELITY and key is not None:
+        return _fidelity_reduce_count(key, packet_count, p)
     return _binomial_sample(packet_count, p)
 
 
@@ -233,6 +267,105 @@ def _int_upscale_ratio(device_rate: int) -> int:
     if FORWARD_RATE <= 0:
         return 1
     return max(1, device_rate // FORWARD_RATE)
+
+
+def _fidelity_window_bucket() -> int:
+    if FIDELITY_WINDOW_SECONDS <= 0.0:
+        return 0
+    return int(time.monotonic() / FIDELITY_WINDOW_SECONDS)
+
+
+def _prefix24(ipv4_as_u32: int) -> int:
+    return (ipv4_as_u32 >> 8) & 0x00FF_FFFF
+
+
+def _size_bucket(packet_count: int, octet_count: int) -> int:
+    if packet_count <= 0:
+        return 0
+    avg = octet_count / packet_count if octet_count > 0 else 0
+    if avg <= 128:
+        return 1
+    if avg <= 512:
+        return 2
+    if avg <= 1500:
+        return 3
+    return 4
+
+
+def _fidelity_key_for_sflow(agent_ip: str | None, source_id: int) -> object:
+    window = _fidelity_window_bucket()
+    return ("sflow", FIDELITY_TARGET, agent_ip or "", source_id, window)
+
+
+def _fidelity_key_for_nf5(
+    exporter_ip: str,
+    srcaddr: int,
+    dstaddr: int,
+    srcport: int,
+    dstport: int,
+    protocol: int,
+    packets: int,
+    octets: int,
+) -> object:
+    src_pref = _prefix24(srcaddr)
+    dst_pref = _prefix24(dstaddr)
+    sz = _size_bucket(packets, octets)
+    window = _fidelity_window_bucket()
+
+    if FIDELITY_TARGET == "top_talkers":
+        return ("nf5", "top", exporter_ip, srcaddr, window)
+    if FIDELITY_TARGET == "protocol_mix":
+        return ("nf5", "proto", exporter_ip, protocol, dstport, window)
+    if FIDELITY_TARGET == "prefix_ranking":
+        return ("nf5", "prefix", exporter_ip, src_pref, dst_pref, window)
+    if FIDELITY_TARGET == "burst_visibility":
+        return ("nf5", "burst", exporter_ip, window)
+    if FIDELITY_TARGET == "byte_distribution":
+        return ("nf5", "bytes", exporter_ip, sz, protocol, window)
+
+    # balanced: preserve a blend of protocol/port mix, prefix ranking, and size shape
+    return ("nf5", "balanced", exporter_ip, protocol, dstport, src_pref, dst_pref, sz, window)
+
+
+def _fidelity_key_for_flowset(
+    exporter_ip: str,
+    domain_id: int,
+    srcaddr: int,
+    dstaddr: int,
+    srcport: int,
+    dstport: int,
+    protocol: int,
+    packets: int,
+    octets: int,
+) -> object:
+    src_pref = _prefix24(srcaddr)
+    dst_pref = _prefix24(dstaddr)
+    sz = _size_bucket(packets, octets)
+    window = _fidelity_window_bucket()
+
+    if FIDELITY_TARGET == "top_talkers":
+        return ("flowset", "top", exporter_ip, domain_id, srcaddr, window)
+    if FIDELITY_TARGET == "protocol_mix":
+        return ("flowset", "proto", exporter_ip, domain_id, protocol, dstport, window)
+    if FIDELITY_TARGET == "prefix_ranking":
+        return ("flowset", "prefix", exporter_ip, domain_id, src_pref, dst_pref, window)
+    if FIDELITY_TARGET == "burst_visibility":
+        return ("flowset", "burst", exporter_ip, domain_id, window)
+    if FIDELITY_TARGET == "byte_distribution":
+        return ("flowset", "bytes", exporter_ip, domain_id, sz, protocol, window)
+
+    return (
+        "flowset",
+        "balanced",
+        exporter_ip,
+        domain_id,
+        protocol,
+        dstport,
+        src_pref,
+        dst_pref,
+        sz,
+        window,
+    )
 
 
 # ─── sFlow processing ─────────────────────────────────────────────────────────
@@ -375,6 +508,7 @@ def _normalize_sflow_sample(data: bytes, agent_ip: str | None = None) -> bytes |
     if len(data) < 28:
         raise ValueError(f"Flow sample too short: {len(data)} bytes")
 
+    source_id = struct.unpack_from("!I", data, 4)[0]
     device_rate = struct.unpack_from("!I", data, 8)[0]
 
     if agent_ip is not None and agent_ip in DEVICE_RATES:
@@ -393,8 +527,11 @@ def _normalize_sflow_sample(data: bytes, agent_ip: str | None = None) -> bytes |
     elif device_rate < FORWARD_RATE:
         # Device samples more often than target — probabilistically drop
         # this sample so the expected flow count matches FORWARD_RATE.
-        # On average: forwarded_flows × FORWARD_RATE = device_rate × captured_flows
-        if random.random() >= device_rate / FORWARD_RATE:
+        # In fidelity mode, preserve the same long-run keep ratio with a
+        # deterministic quota so the reduced stream is less bursty.
+        p_keep = device_rate / FORWARD_RATE
+        keep_sample = _thin_packet_counter(1, p_keep, key=_fidelity_key_for_sflow(agent_ip, source_id)) > 0
+        if not keep_sample:
             return None
         ratio = 1
     else:
@@ -665,14 +802,20 @@ def _normalize_data_flowset(
         return flowset
 
     # Build offset index for all fields once.
-    pkt_meta: dict[int, tuple[int, int]] = {}   # ftype → (offset, len)
+    pkt_meta: dict[int, tuple[int, int]] = {}    # ftype -> (offset, len)
     byte_meta: list[tuple[int, int, int]] = []   # (ftype, offset, len)
+    scalar_meta: dict[int, tuple[int, int]] = {} # ftype -> (offset, len)
+    bytes_for_pkt: dict[int, tuple[int, int]] = {}  # pkt_type -> (offset, len)
     rec_off = 0
     for ftype, flen in fields:
         if ftype in (_NF_IN_PKTS, _NF_OUT_PKTS):
             pkt_meta[ftype] = (rec_off, flen)
         elif ftype in (_NF_IN_BYTES, _NF_OUT_BYTES):
             byte_meta.append((ftype, rec_off, flen))
+            pkt_type = _NF_IN_PKTS if ftype == _NF_IN_BYTES else _NF_OUT_PKTS
+            bytes_for_pkt[pkt_type] = (rec_off, flen)
+        elif ftype in (_NF_PROTOCOL, _NF_L4_SRC_PORT, _NF_L4_DST_PORT, _NF_IPV4_SRC_ADDR, _NF_IPV4_DST_ADDR):
+            scalar_meta[ftype] = (rec_off, flen)
         rec_off += flen
 
     out_parts: list[bytes] = []
@@ -709,6 +852,27 @@ def _normalize_data_flowset(
             orig_pkts: dict[int, int] = {}
             kept_pkts: dict[int, int] = {}
 
+            srcaddr = 0
+            dstaddr = 0
+            srcport = 0
+            dstport = 0
+            protocol = 0
+            src_meta = scalar_meta.get(_NF_IPV4_SRC_ADDR)
+            if src_meta:
+                srcaddr = _read_uint_be(record, src_meta[0], src_meta[1])
+            dst_meta = scalar_meta.get(_NF_IPV4_DST_ADDR)
+            if dst_meta:
+                dstaddr = _read_uint_be(record, dst_meta[0], dst_meta[1])
+            sport_meta = scalar_meta.get(_NF_L4_SRC_PORT)
+            if sport_meta:
+                srcport = _read_uint_be(record, sport_meta[0], sport_meta[1])
+            dport_meta = scalar_meta.get(_NF_L4_DST_PORT)
+            if dport_meta:
+                dstport = _read_uint_be(record, dport_meta[0], dport_meta[1])
+            proto_meta = scalar_meta.get(_NF_PROTOCOL)
+            if proto_meta:
+                protocol = _read_uint_be(record, proto_meta[0], proto_meta[1])
+
             for pkt_type in (_NF_IN_PKTS, _NF_OUT_PKTS):
                 meta = pkt_meta.get(pkt_type)
                 if not meta:
@@ -716,7 +880,26 @@ def _normalize_data_flowset(
                 had_pkt_field = True
                 pkt_off, pkt_len = meta
                 pkt_val = _read_uint_be(record, pkt_off, pkt_len)
-                kept = _thin_packet_counter(pkt_val, p_keep)
+                byte_val = 0
+                byte_meta_for_pkt = bytes_for_pkt.get(pkt_type)
+                if byte_meta_for_pkt:
+                    byte_val = _read_uint_be(record, byte_meta_for_pkt[0], byte_meta_for_pkt[1])
+                fidelity_key = _fidelity_key_for_flowset(
+                    src_ip,
+                    domain_id,
+                    srcaddr,
+                    dstaddr,
+                    srcport,
+                    dstport,
+                    protocol,
+                    pkt_val,
+                    byte_val,
+                )
+                kept = _thin_packet_counter(
+                    pkt_val,
+                    p_keep,
+                    key=(fidelity_key, pkt_type),
+                )
                 orig_pkts[pkt_type] = pkt_val
                 kept_pkts[pkt_type] = kept
                 _write_uint_be(record, pkt_off, pkt_len, kept)
@@ -784,7 +967,21 @@ def convert_nf5_to_nf9(data: bytes, src_ip: str) -> bytes | None:
             kept_octets = min(doctets * upscale_ratio, 0xFFFF_FFFF)
         elif device_rate < FORWARD_RATE and FORWARD_RATE > 0:
             # Downscale: binomial thinning.
-            kept_pkts = _thin_packet_counter(dpkts, p_keep)
+            fidelity_key = _fidelity_key_for_nf5(
+                src_ip,
+                srcaddr,
+                dstaddr,
+                srcport,
+                dstport,
+                prot,
+                dpkts,
+                doctets,
+            )
+            kept_pkts = _thin_packet_counter(
+                dpkts,
+                p_keep,
+                key=fidelity_key,
+            )
             if kept_pkts <= 0:
                 continue
             kept_octets = _thin_octet_counter(doctets, dpkts, kept_pkts)
@@ -1196,17 +1393,23 @@ async def main() -> None:
 
     override_info = f" device_overrides={len(DEVICE_RATES)}" if DEVICE_RATES else ""
     spoof_info = " udp_src_spoof=on" if SPOOF_UDP_SOURCE else ""
+    fidelity_info = ""
+    if FIDELITY:
+        fidelity_info = (
+            f" fidelity=on target={FIDELITY_TARGET}"
+            f" window={FIDELITY_WINDOW_SECONDS}s"
+        )
     print(
         f"sflow is listening on :{SFLOW_PORT} (UDP+TCP) "
         f"→ {FORWARD_IP}:{SFLOW_FORWARD_PORT} "
         f"forward_rate={FORWARD_RATE} default_rate={DEFAULT_SAMPLING_RATE}"
-        f"{override_info}{spoof_info}",
+        f"{override_info}{spoof_info}{fidelity_info}",
         flush=True,
     )
     print(
         f"netflow is listening on :{NETFLOW_LISTEN_PORT} (UDP+TCP) "
         f"→ {FORWARD_IP}:{NETFLOW_FORWARD_PORT} "
-        f"(v5→v9 conversion, v9/IPFIX normalise-in-place){spoof_info}",
+        f"(v5→v9 conversion, v9/IPFIX normalise-in-place){spoof_info}{fidelity_info}",
         flush=True,
     )
 

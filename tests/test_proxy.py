@@ -75,10 +75,12 @@ def _clear_proxy_state():
     proxy._tmpl_cache.clear()
     proxy._source_last_seen.clear()
     proxy._fwd_last_seen.clear()
+    proxy._fidelity_remainder.clear()
     yield
     proxy._tmpl_cache.clear()
     proxy._source_last_seen.clear()
     proxy._fwd_last_seen.clear()
+    proxy._fidelity_remainder.clear()
 
 
 def test_convert_nf5_to_nf9_drops_record_when_all_packets_thinned(monkeypatch: pytest.MonkeyPatch):
@@ -372,3 +374,118 @@ def test_normalize_data_flowset_scales_bytes_without_packet_field(monkeypatch: p
     records = _extract_simple_flowset_records(out)
     assert len(records) == 1
     assert records[0][1] == 500
+
+
+def test_thin_packet_counter_fidelity_preserves_exact_quota(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(proxy, "FIDELITY", True)
+
+    kept = [proxy._thin_packet_counter(1, 0.1, key=("test", "pkts")) for _ in range(10)]
+
+    assert sum(kept) == 1
+    assert kept[-1] == 1
+
+
+def test_convert_nf5_to_nf9_fidelity_keeps_one_of_ten_single_packet_records(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(proxy, "FORWARD_RATE", 100)
+    monkeypatch.setattr(proxy, "FIDELITY", True)
+
+    records = [
+        build_nf5_record(
+            src_ip=f"10.0.0.{i}",
+            dst_ip="192.0.2.1",
+            src_port=12000 + i,
+            dst_port=80,
+            packets=1,
+            octets=100,
+            first=1000,
+            last=2000,
+        )
+        for i in range(1, 11)
+    ]
+    packet = build_nf5_packet(records, seq=1, sampling_rate=10)
+
+    out = proxy.convert_nf5_to_nf9(packet, "198.51.100.10")
+
+    assert out is not None
+    out_records = _extract_v5_converted_records(out)
+    assert len(out_records) == 1
+    assert out_records[0][5] == 1
+    assert out_records[0][6] == 100
+
+
+def test_normalize_data_flowset_fidelity_keeps_exact_quota(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(proxy, "FORWARD_RATE", 100)
+    monkeypatch.setattr(proxy, "FIDELITY", True)
+
+    src_ip = "198.51.100.20"
+    domain_id = 1234
+    tmpl_id = 300
+
+    proxy._tmpl_cache[src_ip] = {
+        domain_id: {
+            tmpl_id: [
+                (proxy._NF_IN_PKTS, 4),
+                (proxy._NF_IN_BYTES, 4),
+            ]
+        }
+    }
+
+    flowset = _build_simple_flowset(tmpl_id, [(1, 100)] * 10)
+
+    out = proxy._normalize_data_flowset(
+        flowset=flowset,
+        tmpl_id=tmpl_id,
+        src_ip=src_ip,
+        domain_id=domain_id,
+        device_rate=10,
+    )
+
+    assert out is not None
+    assert _extract_simple_flowset_records(out) == [(1, 100)]
+
+
+def test_convert_nf5_to_nf9_fidelity_protocol_mix_preserves_per_port_quota(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(proxy, "FORWARD_RATE", 100)
+    monkeypatch.setattr(proxy, "FIDELITY", True)
+    monkeypatch.setattr(proxy, "FIDELITY_TARGET", "protocol_mix")
+    monkeypatch.setattr(proxy, "FIDELITY_WINDOW_SECONDS", 0.0)
+
+    records = []
+    for i in range(10):
+        records.append(
+            build_nf5_record(
+                src_ip=f"10.0.0.{i + 1}",
+                dst_ip="192.0.2.10",
+                src_port=20000 + i,
+                dst_port=80,
+                packets=1,
+                octets=120,
+                first=1000,
+                last=2000,
+                proto=6,
+            )
+        )
+    for i in range(10):
+        records.append(
+            build_nf5_record(
+                src_ip=f"10.0.1.{i + 1}",
+                dst_ip="192.0.2.20",
+                src_port=21000 + i,
+                dst_port=443,
+                packets=1,
+                octets=120,
+                first=1000,
+                last=2000,
+                proto=6,
+            )
+        )
+
+    packet = build_nf5_packet(records, seq=5, sampling_rate=10)
+    out = proxy.convert_nf5_to_nf9(packet, "198.51.100.30")
+
+    assert out is not None
+    out_records = _extract_v5_converted_records(out)
+    assert len(out_records) == 2
+
+    dports = sorted(rec[10] for rec in out_records)
+    assert dports == [80, 443]

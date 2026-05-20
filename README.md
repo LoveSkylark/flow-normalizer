@@ -26,6 +26,7 @@ and forwards everything to a collector.
 - NetFlow/IPFIX: UDP and TCP (default 2055)
 - NetFlow v5 converted to v9
 - v9 and IPFIX normalized in place
+- Optional deterministic downscale mode (`FIDELITY=true`)
 
 ---
 
@@ -62,6 +63,22 @@ When `device_rate < FORWARD_RATE` the proxy randomly drops whole flow records
 using binomial sampling so the expected forwarded count matches `FORWARD_RATE`.
 Byte counters for kept records are scaled proportionally to packet counters.
 
+When `FIDELITY=true`, downscale switches to deterministic quota thinning.
+Long-run keep ratio remains the same, but forwarded records are steadier and
+less bursty than random thinning.
+
+Fidelity can be targeted with `FIDELITY_TARGET`:
+
+- `balanced` (default): preserves a mix of protocol/port, prefix ranking, and byte-size shape
+- `top_talkers`: biases selection consistency by source talker
+- `protocol_mix`: preserves protocol and destination-port mix
+- `prefix_ranking`: preserves source/destination prefix ranking
+- `burst_visibility`: keeps quotas in short windows so bursts stay visible
+- `byte_distribution`: preserves packet-size/byte distribution buckets
+
+Use `FIDELITY_WINDOW_SECONDS` (default `1.0`) to control quota windowing.
+Smaller windows preserve burst shape better; larger windows smooth more.
+
 ### Source identity
 
 By default the collector sees the normalizer's IP as the exporter because
@@ -90,6 +107,9 @@ Set via environment variables.
 | `FORWARD_IP`            |         | yes      |                                           |
 | `FORWARD_RATE`          | 100     | no       | Sampling rate stamped on all output flows |
 | `DEFAULT_SAMPLING_RATE` | 512     | no       | Used when device sends no embedded rate   |
+| `FIDELITY`              | false   | no       | Deterministic quota thinning for downscale |
+| `FIDELITY_TARGET`       | balanced | no      | Fidelity objective: balanced/top_talkers/protocol_mix/prefix_ranking/burst_visibility/byte_distribution |
+| `FIDELITY_WINDOW_SECONDS` | 1.0   | no       | Quota window size used by fidelity selector |
 | `DEVICE_RATES`          |         | no       | Per-device overrides, see below           |
 | `SFLOW_PORT`            | 6343    | no       | Listen port (UDP + TCP)                   |
 | `SFLOW_FORWARD_PORT`    | 6343    | no       |                                           |
@@ -135,6 +155,30 @@ DEFAULT_SAMPLING_RATE=512
 docker compose up -d --build
 ```
 
+### Optional: enable fidelity mode
+
+Set this in `.env` when you want steadier downscale output:
+
+```env
+FIDELITY=true
+FIDELITY_TARGET=balanced
+FIDELITY_WINDOW_SECONDS=1.0
+```
+
+Or inline in `docker-compose.yml`:
+
+```yaml
+services:
+  flow-normalizer:
+    environment:
+      - FORWARD_IP=10.0.0.10
+      - FORWARD_RATE=100
+      - DEFAULT_SAMPLING_RATE=512
+      - FIDELITY=true
+      - FIDELITY_TARGET=balanced
+      - FIDELITY_WINDOW_SECONDS=1.0
+```
+
 ### 3) Verify
 
 ```sh
@@ -164,6 +208,16 @@ docker compose down
 - Missing sampling rate → assume `DEFAULT_SAMPLING_RATE`
 
 Counter samples are never modified.
+
+### Downscale mode comparison
+
+| Mode | Keep ratio target | Forwarded stream shape | Best for |
+| ---- | ----------------- | ---------------------- | -------- |
+| Random (default) | `device_rate / FORWARD_RATE` in expectation | Naturally noisy and bursty | Generic reduction with no extra constraints |
+| Fidelity (`FIDELITY=true`) | Same long-run ratio | Smoother, steadier packet flow | Operator pipelines that prefer stable per-interval volume |
+
+Both modes preserve the same long-run traffic estimate. Fidelity mode mainly
+reduces short-window variance in the reduced stream.
 
 ---
 
@@ -201,7 +255,7 @@ If templates are missing, data passes through unchanged.
 
 ## Architecture
 
-```
+```text
 asyncio event loop
   sFlow UDP     → parse → normalize → forward UDP (FORWARD_IP:SFLOW_FORWARD_PORT)
   sFlow TCP     → parse → normalize → forward TCP (FORWARD_IP:SFLOW_FORWARD_PORT)
